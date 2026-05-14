@@ -30,6 +30,10 @@ lto = "thin"
 strip = true
 codegen-units = 1
 
+# cargo-dist builds with this profile; inherit release optimizations.
+[profile.dist]
+inherits = "release"
+
 # cargo-dist configuration
 [workspace.metadata.dist]
 cargo-dist-version = "0.31.0"
