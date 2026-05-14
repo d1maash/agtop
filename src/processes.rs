@@ -12,23 +12,39 @@ use std::time::{Duration, Instant, SystemTime};
 ///   4. For Codex, also match parsed `session.cwd` to running CLI cwds.
 ///
 /// Returns None if `ps` or `lsof` is unavailable so the caller can fall back.
+/// Sessions whose cwd has a live CLI process AND whose file was touched
+/// in the recent past (30 min). Multiple concurrent terminals in the same
+/// cwd produce multiple paths.
 pub fn running_session_paths() -> Option<HashSet<PathBuf>> {
     let cwds = running_cli_cwds()?;
     let claude_root = crate::sources::claude_root()?;
     let mut paths = HashSet::new();
+    let window = Duration::from_secs(30 * 60);
+    let now = SystemTime::now();
     for cwd in &cwds {
         let encoded = encode_cwd_for_claude(cwd);
         let project_dir = claude_root.join(&encoded);
-        if let Some(latest) = latest_jsonl(&project_dir) {
-            paths.insert(latest);
+        let Ok(entries) = std::fs::read_dir(&project_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            let Ok(modified) = meta.modified() else { continue };
+            if now.duration_since(modified).map_or(false, |d| d <= window) {
+                paths.insert(p);
+            }
         }
     }
     Some(paths)
 }
 
 /// CWDs of every running `claude`/`codex` CLI process. Excludes desktop
-/// Electron apps and helpers.
-fn running_cli_cwds() -> Option<Vec<PathBuf>> {
+/// Electron apps and helpers. Dedups.
+fn running_cli_cwds() -> Option<HashSet<PathBuf>> {
     let out = Command::new("ps")
         .args(["-A", "-o", "pid=,args="])
         .output()
@@ -45,14 +61,21 @@ fn running_cli_cwds() -> Option<Vec<PathBuf>> {
             Ok(p) => p,
             Err(_) => continue,
         };
-        if is_cli_command(rest.trim()) {
+        let rest = rest.trim();
+        if is_cli_command(rest) {
             pids.push(pid);
         }
+        if std::env::var("AGTOP_DEBUG").is_ok() && rest.starts_with("claude") {
+            eprintln!("[debug] pid={} cmd={:?} matched={}", pid, rest, is_cli_command(rest));
+        }
     }
-    let mut cwds = Vec::new();
+    let mut cwds = HashSet::new();
     for pid in pids {
         if let Some(cwd) = cwd_of(pid) {
-            cwds.push(cwd);
+            if std::env::var("AGTOP_DEBUG").is_ok() {
+                eprintln!("[debug] pid={} cwd={}", pid, cwd.display());
+            }
+            cwds.insert(cwd);
         }
     }
     Some(cwds)
@@ -90,22 +113,6 @@ fn cwd_of(pid: u32) -> Option<PathBuf> {
 /// with '-' (the leading slash becomes a leading dash too).
 fn encode_cwd_for_claude(cwd: &Path) -> String {
     cwd.to_string_lossy().replace('/', "-")
-}
-
-fn latest_jsonl(dir: &Path) -> Option<PathBuf> {
-    let mut best: Option<(SystemTime, PathBuf)> = None;
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
-        let p = entry.path();
-        if p.extension().and_then(|s| s.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let Ok(meta) = entry.metadata() else { continue };
-        let Ok(m) = meta.modified() else { continue };
-        if best.as_ref().map_or(true, |(bm, _)| m > *bm) {
-            best = Some((m, p));
-        }
-    }
-    best.map(|(_, p)| p)
 }
 
 pub struct OpenFilesCache {
