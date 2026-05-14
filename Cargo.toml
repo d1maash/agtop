@@ -30,5 +30,20 @@ lto = "thin"
 strip = true
 codegen-units = 1
 
-# cargo-dist configuration (populated by `dist init`)
+# cargo-dist configuration
 [workspace.metadata.dist]
+cargo-dist-version = "0.31.0"
+ci = "github"
+installers = ["shell", "homebrew"]
+tap = "d1maash/homebrew-tap"
+publish-jobs = ["homebrew"]
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+pr-run-mode = "plan"
+install-path = "CARGO_HOME"
+install-updater = false
+
