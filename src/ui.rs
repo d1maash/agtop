@@ -1,4 +1,5 @@
 use crate::model::{AgentKind, Session};
+use crate::watcher::Shared;
 use anyhow::Result;
 use chrono::Utc;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -13,15 +14,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 use ratatui::Terminal;
 use std::io::{self, Stdout};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-const REFRESH: Duration = Duration::from_millis(2000);
-const TICK: Duration = Duration::from_millis(100);
+const TICK: Duration = Duration::from_millis(250);
 const ACTIVE_WINDOW_SECS: i64 = 120;
 
-pub fn run() -> Result<()> {
+pub fn run(shared: Shared) -> Result<()> {
     let mut terminal = setup()?;
-    let res = main_loop(&mut terminal);
+    let res = main_loop(&mut terminal, shared);
     teardown(&mut terminal)?;
     res
 }
@@ -46,60 +46,45 @@ enum SortBy {
     LastActivity,
     Tokens,
     Project,
+    Cost,
+    Rate,
 }
 
 struct App {
-    sessions: Vec<Session>,
-    state: TableState,
     sort: SortBy,
-    last_refresh: Instant,
+    state: TableState,
     show_inactive: bool,
+    shared: Shared,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(shared: Shared) -> Self {
         let mut state = TableState::default();
         state.select(Some(0));
         Self {
-            sessions: Vec::new(),
-            state,
             sort: SortBy::LastActivity,
-            last_refresh: Instant::now() - REFRESH,
+            state,
             show_inactive: false,
+            shared,
         }
     }
 
-    fn refresh(&mut self) {
-        if let Ok(mut s) = crate::sources::scan_all() {
-            sort_sessions(&mut s, self.sort);
-            self.sessions = s;
-            let max = self.visible().len().saturating_sub(1);
-            if let Some(cur) = self.state.selected() {
-                if cur > max {
-                    self.state.select(Some(max));
-                }
-            }
-        }
-        self.last_refresh = Instant::now();
-    }
-
-    fn visible(&self) -> Vec<&Session> {
+    fn snapshot(&self) -> Vec<Session> {
+        let map = self.shared.lock().unwrap();
+        let mut v: Vec<Session> = map.values().cloned().collect();
         let now = Utc::now();
-        self.sessions
-            .iter()
-            .filter(|s| {
-                if self.show_inactive {
-                    return true;
-                }
+        if !self.show_inactive {
+            v.retain(|s| {
                 s.last_activity
                     .map(|t| (now - t).num_seconds().abs() <= 60 * 60 * 24)
                     .unwrap_or(false)
-            })
-            .collect()
+            });
+        }
+        sort_sessions(&mut v, self.sort);
+        v
     }
 
-    fn move_cursor(&mut self, delta: isize) {
-        let len = self.visible().len();
+    fn move_cursor(&mut self, delta: isize, len: usize) {
         if len == 0 {
             self.state.select(None);
             return;
@@ -115,54 +100,48 @@ fn sort_sessions(sessions: &mut [Session], by: SortBy) {
         SortBy::LastActivity => sessions.sort_by(|a, b| b.last_activity.cmp(&a.last_activity)),
         SortBy::Tokens => sessions.sort_by(|a, b| b.tokens.total().cmp(&a.tokens.total())),
         SortBy::Project => sessions.sort_by(|a, b| a.project_name().cmp(&b.project_name())),
+        SortBy::Cost => sessions.sort_by(|a, b| {
+            b.cost_usd()
+                .unwrap_or(0.0)
+                .partial_cmp(&a.cost_usd().unwrap_or(0.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }),
+        SortBy::Rate => sessions.sort_by(|a, b| b.tokens_per_min().cmp(&a.tokens_per_min())),
     }
 }
 
-fn main_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
-    let mut app = App::new();
-    app.refresh();
+fn main_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, shared: Shared) -> Result<()> {
+    let mut app = App::new(shared);
 
     loop {
-        terminal.draw(|f| draw(f, &mut app))?;
+        let sessions = app.snapshot();
+        terminal.draw(|f| draw(f, &mut app, &sessions))?;
 
         if event::poll(TICK)? {
             if let Event::Key(k) = event::read()? {
                 if k.kind != KeyEventKind::Press {
                     continue;
                 }
+                let len = app.snapshot().len();
                 match k.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
-                    KeyCode::Down | KeyCode::Char('j') => app.move_cursor(1),
-                    KeyCode::Up | KeyCode::Char('k') => app.move_cursor(-1),
-                    KeyCode::Char('r') => app.refresh(),
-                    KeyCode::Char('t') => {
-                        app.sort = SortBy::Tokens;
-                        sort_sessions(&mut app.sessions, app.sort);
-                    }
-                    KeyCode::Char('a') => {
-                        app.sort = SortBy::LastActivity;
-                        sort_sessions(&mut app.sessions, app.sort);
-                    }
-                    KeyCode::Char('p') => {
-                        app.sort = SortBy::Project;
-                        sort_sessions(&mut app.sessions, app.sort);
-                    }
-                    KeyCode::Char('A') => {
-                        app.show_inactive = !app.show_inactive;
-                    }
+                    KeyCode::Down | KeyCode::Char('j') => app.move_cursor(1, len),
+                    KeyCode::Up | KeyCode::Char('k') => app.move_cursor(-1, len),
+                    KeyCode::Char('t') => app.sort = SortBy::Tokens,
+                    KeyCode::Char('a') => app.sort = SortBy::LastActivity,
+                    KeyCode::Char('p') => app.sort = SortBy::Project,
+                    KeyCode::Char('c') => app.sort = SortBy::Cost,
+                    KeyCode::Char('m') => app.sort = SortBy::Rate,
+                    KeyCode::Char('A') => app.show_inactive = !app.show_inactive,
                     _ => {}
                 }
             }
-        }
-
-        if app.last_refresh.elapsed() >= REFRESH {
-            app.refresh();
         }
     }
     Ok(())
 }
 
-fn draw(f: &mut ratatui::Frame, app: &mut App) {
+fn draw(f: &mut ratatui::Frame, app: &mut App, sessions: &[Session]) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -172,44 +151,56 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
         ])
         .split(f.area());
 
-    draw_header(f, chunks[0], app);
-    draw_table(f, chunks[1], app);
+    draw_header(f, chunks[0], sessions);
+    draw_table(f, chunks[1], app, sessions);
     draw_footer(f, chunks[2], app);
 }
 
-fn draw_header(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
-    let visible = app.visible();
-    let total_tokens: u64 = visible.iter().map(|s| s.tokens.total()).sum();
-    let active = visible
-        .iter()
-        .filter(|s| is_active(s))
-        .count();
-
-    let claude_n = visible.iter().filter(|s| s.kind == AgentKind::Claude).count();
-    let codex_n = visible.iter().filter(|s| s.kind == AgentKind::Codex).count();
+fn draw_header(f: &mut ratatui::Frame, area: ratatui::layout::Rect, sessions: &[Session]) {
+    let total_tokens: u64 = sessions.iter().map(|s| s.tokens.total()).sum();
+    let total_cost: f64 = sessions.iter().filter_map(|s| s.cost_usd()).sum();
+    let active = sessions.iter().filter(|s| is_active(s)).count();
+    let claude_n = sessions.iter().filter(|s| s.kind == AgentKind::Claude).count();
+    let codex_n = sessions.iter().filter(|s| s.kind == AgentKind::Codex).count();
+    let live_rate: u64 = sessions.iter().map(|s| s.tokens_per_min()).sum();
 
     let line = Line::from(vec![
-        Span::styled("agent-top", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled("agtop", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Span::raw("   "),
-        Span::raw(format!("sessions: {}  active: {}  ", visible.len(), active)),
+        Span::raw(format!("sessions: {}  active: {}  ", sessions.len(), active)),
         Span::styled(format!("claude:{}  ", claude_n), Style::default().fg(Color::Magenta)),
         Span::styled(format!("codex:{}", codex_n), Style::default().fg(Color::Green)),
         Span::raw(format!("   tokens: {}", fmt_num(total_tokens))),
+        Span::raw("   "),
+        Span::styled(
+            format!("${:.2}", total_cost),
+            Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("   "),
+        Span::styled(
+            format!("{} tok/min", fmt_num(live_rate)),
+            Style::default().fg(Color::Yellow),
+        ),
     ]);
     let p = Paragraph::new(line).block(Block::default().borders(Borders::ALL));
     f.render_widget(p, area);
 }
 
-fn draw_table(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut App) {
+fn draw_table(
+    f: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    app: &mut App,
+    sessions: &[Session],
+) {
     let header_cells = [
-        "SRC", "ID", "PROJECT", "MODEL", "IN", "OUT", "CACHE", "TOTAL", "TURNS", "AGO", "STATUS",
+        "SRC", "ID", "PROJECT", "MODEL", "IN", "OUT", "CACHE", "TOTAL", "TOK/MIN", "$", "AGO",
+        "STATUS",
     ]
     .iter()
     .map(|h| Cell::from(*h).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
     let header = Row::new(header_cells).height(1);
 
-    let visible = app.visible();
-    let rows: Vec<Row> = visible
+    let rows: Vec<Row> = sessions
         .iter()
         .map(|s| {
             let src_color = match s.kind {
@@ -219,6 +210,21 @@ fn draw_table(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut App
             let active = is_active(s);
             let status_text = if active { "● active" } else { "  idle" };
             let status_color = if active { Color::Green } else { Color::DarkGray };
+
+            let rate = s.tokens_per_min();
+            let rate_cell = if rate > 0 {
+                Cell::from(fmt_num(rate)).style(Style::default().fg(Color::Yellow))
+            } else {
+                Cell::from("·").style(Style::default().fg(Color::DarkGray))
+            };
+
+            let cost_cell = match s.cost_usd() {
+                Some(c) if c >= 0.01 => Cell::from(format!("${:.2}", c))
+                    .style(Style::default().fg(Color::LightGreen)),
+                Some(_) => Cell::from("<$0.01").style(Style::default().fg(Color::DarkGray)),
+                None => Cell::from("-").style(Style::default().fg(Color::DarkGray)),
+            };
+
             Row::new(vec![
                 Cell::from(s.kind.label()).style(Style::default().fg(src_color)),
                 Cell::from(s.short_id()),
@@ -229,7 +235,8 @@ fn draw_table(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut App
                 Cell::from(fmt_num(s.tokens.cache_read + s.tokens.cache_creation)),
                 Cell::from(fmt_num(s.tokens.total()))
                     .style(Style::default().add_modifier(Modifier::BOLD)),
-                Cell::from(s.turn_count.to_string()),
+                rate_cell,
+                cost_cell,
                 Cell::from(format_ago(s)),
                 Cell::from(status_text).style(Style::default().fg(status_color)),
             ])
@@ -245,8 +252,9 @@ fn draw_table(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut App
         Constraint::Length(9),
         Constraint::Length(9),
         Constraint::Length(10),
-        Constraint::Length(6),
+        Constraint::Length(9),
         Constraint::Length(8),
+        Constraint::Length(7),
         Constraint::Min(8),
     ];
 
@@ -254,10 +262,14 @@ fn draw_table(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut App
         .header(header)
         .block(Block::default().borders(Borders::ALL).title(format!(
             " sessions ({}) — sort: {} ",
-            visible.len(),
+            sessions.len(),
             sort_label(app.sort)
         )))
-        .row_highlight_style(Style::default().bg(Color::Rgb(40, 40, 60)).add_modifier(Modifier::BOLD));
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::Rgb(40, 40, 60))
+                .add_modifier(Modifier::BOLD),
+        );
 
     f.render_stateful_widget(table, area, &mut app.state);
 }
@@ -265,22 +277,23 @@ fn draw_table(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut App
 fn draw_footer(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
     let visibility = if app.show_inactive { "all" } else { "24h" };
     let line = Line::from(vec![
-        Span::styled(" q ", Style::default().bg(Color::DarkGray)),
-        Span::raw(" quit  "),
-        Span::styled(" ↑↓/jk ", Style::default().bg(Color::DarkGray)),
-        Span::raw(" nav  "),
-        Span::styled(" t ", Style::default().bg(Color::DarkGray)),
-        Span::raw(" sort:tokens  "),
-        Span::styled(" a ", Style::default().bg(Color::DarkGray)),
-        Span::raw(" sort:activity  "),
-        Span::styled(" p ", Style::default().bg(Color::DarkGray)),
-        Span::raw(" sort:project  "),
-        Span::styled(" A ", Style::default().bg(Color::DarkGray)),
-        Span::raw(format!(" show:{}  ", visibility)),
-        Span::styled(" r ", Style::default().bg(Color::DarkGray)),
-        Span::raw(" refresh"),
+        chip("q"), Span::raw(" quit  "),
+        chip("↑↓/jk"), Span::raw(" nav  "),
+        chip("t"), Span::raw(" tokens  "),
+        chip("c"), Span::raw(" cost  "),
+        chip("m"), Span::raw(" rate  "),
+        chip("a"), Span::raw(" activity  "),
+        chip("p"), Span::raw(" project  "),
+        chip("A"), Span::raw(format!(" show:{}", visibility)),
     ]);
     f.render_widget(Paragraph::new(line), area);
+}
+
+fn chip(label: &str) -> Span<'_> {
+    Span::styled(
+        format!(" {} ", label),
+        Style::default().bg(Color::DarkGray).fg(Color::White),
+    )
 }
 
 fn is_active(s: &Session) -> bool {
@@ -327,5 +340,7 @@ fn sort_label(s: SortBy) -> &'static str {
         SortBy::LastActivity => "activity",
         SortBy::Tokens => "tokens",
         SortBy::Project => "project",
+        SortBy::Cost => "cost",
+        SortBy::Rate => "rate",
     }
 }
