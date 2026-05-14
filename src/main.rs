@@ -1,5 +1,6 @@
 mod model;
 mod pricing;
+mod processes;
 mod sources;
 mod ui;
 mod watcher;
