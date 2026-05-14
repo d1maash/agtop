@@ -48,6 +48,7 @@ enum SortBy {
     Project,
     Cost,
     Rate,
+    Source,
 }
 
 struct App {
@@ -55,6 +56,7 @@ struct App {
     state: TableState,
     show_inactive: bool,
     shared: Shared,
+    open_files: crate::processes::OpenFilesCache,
 }
 
 impl App {
@@ -66,22 +68,25 @@ impl App {
             state,
             show_inactive: false,
             shared,
+            open_files: crate::processes::OpenFilesCache::new(),
         }
     }
 
-    fn snapshot(&self) -> Vec<Session> {
+    /// Returns (visible_sessions, total_count_before_filter).
+    fn snapshot(&mut self) -> (Vec<Session>, usize) {
+        let open: Option<std::collections::HashSet<std::path::PathBuf>> =
+            self.open_files.get().cloned();
         let map = self.shared.lock().unwrap();
+        let total = map.len();
         let mut v: Vec<Session> = map.values().cloned().collect();
-        let now = Utc::now();
         if !self.show_inactive {
-            v.retain(|s| {
-                s.last_activity
-                    .map(|t| (now - t).num_seconds().abs() <= 60 * 60 * 24)
-                    .unwrap_or(false)
-            });
+            match open.as_ref() {
+                Some(open_set) => v.retain(|s| open_set.contains(&s.file)),
+                None => v.retain(is_running),
+            }
         }
         sort_sessions(&mut v, self.sort);
-        v
+        (v, total)
     }
 
     fn move_cursor(&mut self, delta: isize, len: usize) {
@@ -107,6 +112,9 @@ fn sort_sessions(sessions: &mut [Session], by: SortBy) {
                 .unwrap_or(std::cmp::Ordering::Equal)
         }),
         SortBy::Rate => sessions.sort_by(|a, b| b.tokens_per_min().cmp(&a.tokens_per_min())),
+        SortBy::Source => sessions.sort_by(|a, b| {
+            (a.kind.label(), b.last_activity).cmp(&(b.kind.label(), a.last_activity))
+        }),
     }
 }
 
@@ -114,15 +122,16 @@ fn main_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, shared: Shared) 
     let mut app = App::new(shared);
 
     loop {
-        let sessions = app.snapshot();
-        terminal.draw(|f| draw(f, &mut app, &sessions))?;
+        let (sessions, total) = app.snapshot();
+        let hidden = total.saturating_sub(sessions.len());
+        terminal.draw(|f| draw(f, &mut app, &sessions, hidden))?;
 
         if event::poll(TICK)? {
             if let Event::Key(k) = event::read()? {
                 if k.kind != KeyEventKind::Press {
                     continue;
                 }
-                let len = app.snapshot().len();
+                let len = app.snapshot().0.len();
                 match k.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
                     KeyCode::Down | KeyCode::Char('j') => app.move_cursor(1, len),
@@ -132,6 +141,7 @@ fn main_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, shared: Shared) 
                     KeyCode::Char('p') => app.sort = SortBy::Project,
                     KeyCode::Char('c') => app.sort = SortBy::Cost,
                     KeyCode::Char('m') => app.sort = SortBy::Rate,
+                    KeyCode::Char('s') => app.sort = SortBy::Source,
                     KeyCode::Char('A') => app.show_inactive = !app.show_inactive,
                     _ => {}
                 }
@@ -141,7 +151,7 @@ fn main_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, shared: Shared) 
     Ok(())
 }
 
-fn draw(f: &mut ratatui::Frame, app: &mut App, sessions: &[Session]) {
+fn draw(f: &mut ratatui::Frame, app: &mut App, sessions: &[Session], hidden: usize) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -152,7 +162,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App, sessions: &[Session]) {
         .split(f.area());
 
     draw_header(f, chunks[0], sessions);
-    draw_table(f, chunks[1], app, sessions);
+    draw_table(f, chunks[1], app, sessions, hidden);
     draw_footer(f, chunks[2], app);
 }
 
@@ -191,6 +201,7 @@ fn draw_table(
     area: ratatui::layout::Rect,
     app: &mut App,
     sessions: &[Session],
+    hidden: usize,
 ) {
     let header_cells = [
         "SRC", "ID", "PROJECT", "MODEL", "IN", "OUT", "CACHE", "TOTAL", "TOK/MIN", "$", "AGO",
@@ -258,13 +269,21 @@ fn draw_table(
         Constraint::Min(8),
     ];
 
+    let title = if hidden > 0 {
+        format!(
+            " sessions ({} of {} — {} hidden, press A) — sort: {} ",
+            sessions.len(),
+            sessions.len() + hidden,
+            hidden,
+            sort_label(app.sort)
+        )
+    } else {
+        format!(" sessions ({}) — sort: {} ", sessions.len(), sort_label(app.sort))
+    };
+
     let table = Table::new(rows, widths)
         .header(header)
-        .block(Block::default().borders(Borders::ALL).title(format!(
-            " sessions ({}) — sort: {} ",
-            sessions.len(),
-            sort_label(app.sort)
-        )))
+        .block(Block::default().borders(Borders::ALL).title(title))
         .row_highlight_style(
             Style::default()
                 .bg(Color::Rgb(40, 40, 60))
@@ -275,7 +294,7 @@ fn draw_table(
 }
 
 fn draw_footer(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
-    let visibility = if app.show_inactive { "all" } else { "24h" };
+    let visibility = if app.show_inactive { "all" } else { "running" };
     let line = Line::from(vec![
         chip("q"), Span::raw(" quit  "),
         chip("↑↓/jk"), Span::raw(" nav  "),
@@ -284,6 +303,7 @@ fn draw_footer(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
         chip("m"), Span::raw(" rate  "),
         chip("a"), Span::raw(" activity  "),
         chip("p"), Span::raw(" project  "),
+        chip("s"), Span::raw(" source  "),
         chip("A"), Span::raw(format!(" show:{}", visibility)),
     ]);
     f.render_widget(Paragraph::new(line), area);
@@ -299,6 +319,23 @@ fn chip(label: &str) -> Span<'_> {
 fn is_active(s: &Session) -> bool {
     s.last_activity
         .map(|t| (Utc::now() - t).num_seconds() <= ACTIVE_WINDOW_SECS)
+        .unwrap_or(false)
+}
+
+/// A session is "running" if either its log file was written to in the last
+/// 2 minutes, or its parsed last_activity is within that window. We check
+/// both because file mtime captures activity that hasn't been parsed yet
+/// (e.g. between watcher ticks), while last_activity covers cases where
+/// the OS reports a stale mtime.
+fn is_running(s: &Session) -> bool {
+    if is_active(s) {
+        return true;
+    }
+    let Ok(meta) = std::fs::metadata(&s.file) else { return false; };
+    let Ok(modified) = meta.modified() else { return false; };
+    modified
+        .elapsed()
+        .map(|d| d.as_secs() <= ACTIVE_WINDOW_SECS as u64)
         .unwrap_or(false)
 }
 
@@ -342,5 +379,6 @@ fn sort_label(s: SortBy) -> &'static str {
         SortBy::Project => "project",
         SortBy::Cost => "cost",
         SortBy::Rate => "rate",
+        SortBy::Source => "source",
     }
 }
