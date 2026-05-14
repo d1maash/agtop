@@ -14,10 +14,31 @@ struct Cli {
     /// Print sessions as a table and exit (no TUI)
     #[arg(long)]
     once: bool,
+    /// Print only the JSONL files of currently-running CLI sessions, then exit.
+    #[arg(long)]
+    running: bool,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.running {
+        match processes::running_session_paths() {
+            Some(set) if set.is_empty() => {
+                eprintln!("(no running CLI sessions detected)");
+            }
+            Some(set) => {
+                let mut paths: Vec<_> = set.into_iter().collect();
+                paths.sort();
+                for p in paths {
+                    println!("{}", p.display());
+                }
+            }
+            None => {
+                eprintln!("ps/lsof unavailable — falling back to heuristic in TUI");
+            }
+        }
+        return Ok(());
+    }
     if cli.once {
         let map = sources::initial_scan()?;
         let mut sessions: Vec<_> = map.into_values().collect();
