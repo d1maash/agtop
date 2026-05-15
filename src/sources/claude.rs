@@ -70,7 +70,7 @@ pub fn update_from_line(session: &mut Session, line: &str, live: bool) {
         if let Some(msg) = parsed.message {
             if let Some(m) = msg.model {
                 if session.model.is_none() || session.model.as_deref() == Some("") {
-                    session.model = Some(m);
+                    session.set_model(m);
                 }
             }
             if let Some(u) = msg.usage {

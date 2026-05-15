@@ -1,3 +1,4 @@
+use crate::pricing::Price;
 use chrono::{DateTime, Duration, Utc};
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -42,6 +43,9 @@ pub struct Session {
     pub file: PathBuf,
     pub cwd: Option<String>,
     pub model: Option<String>,
+    /// Cached pricing for `model`. Resolved once when `model` is set so the
+    /// per-render cost path skips the substring matching in `pricing::lookup`.
+    pub price: Option<Price>,
     pub started_at: Option<DateTime<Utc>>,
     pub last_activity: Option<DateTime<Utc>>,
     pub tokens: TokenStats,
@@ -64,6 +68,7 @@ impl Session {
             file,
             cwd: None,
             model: None,
+            price: None,
             started_at: None,
             last_activity: None,
             tokens: TokenStats::default(),
@@ -71,6 +76,14 @@ impl Session {
             file_offset: 0,
             samples: VecDeque::new(),
         }
+    }
+
+    /// Set the model name and resolve its price once. Source parsers call
+    /// this instead of writing `model` directly so the cached `price` field
+    /// stays in sync.
+    pub fn set_model(&mut self, model: String) {
+        self.price = crate::pricing::lookup(&model);
+        self.model = Some(model);
     }
 
     pub fn short_id(&self) -> String {
@@ -111,6 +124,17 @@ impl Session {
     }
 
     pub fn cost_usd(&self) -> Option<f64> {
-        crate::pricing::cost_usd(self.model.as_deref(), &self.tokens)
+        let p = self.price?;
+        let t = &self.tokens;
+        let per = 1_000_000.0;
+        // `t.reasoning` is informational only — for both Claude and Codex, the
+        // vendor's `output_tokens` already includes reasoning/thinking tokens,
+        // so billing it again here would double-charge.
+        Some(
+            (t.input as f64) * p.input / per
+                + (t.output as f64) * p.output / per
+                + (t.cache_read as f64) * p.cache_read / per
+                + (t.cache_creation as f64) * p.cache_write / per,
+        )
     }
 }

@@ -62,16 +62,3 @@ pub fn lookup(model: &str) -> Option<Price> {
     }
 }
 
-pub fn cost_usd(model: Option<&str>, t: &crate::model::TokenStats) -> Option<f64> {
-    let model = model?;
-    let p = lookup(model)?;
-    let per = 1_000_000.0;
-    // `t.reasoning` is informational only — for both Claude and Codex, the
-    // vendor's `output_tokens` already includes reasoning/thinking tokens, so
-    // billing it again here would double-charge.
-    let cost = (t.input as f64) * p.input / per
-        + (t.output as f64) * p.output / per
-        + (t.cache_read as f64) * p.cache_read / per
-        + (t.cache_creation as f64) * p.cache_write / per;
-    Some(cost)
-}

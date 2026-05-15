@@ -3,9 +3,10 @@ pub mod codex;
 
 use crate::model::{AgentKind, Session};
 use anyhow::Result;
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -65,48 +66,62 @@ pub fn list_files() -> Vec<(AgentKind, PathBuf)> {
 }
 
 /// Read new bytes since `session.file_offset`, parse complete lines,
-/// update session, advance offset to position of last newline read.
+/// update session, advance offset past the last newline consumed.
 /// `live` controls whether to push samples into the rate window.
 pub fn tail(session: &mut Session, live: bool) -> Result<bool> {
-    let mut f = File::open(&session.file)?;
-    let len = f.metadata()?.len();
+    // Cheap probe first: avoid `File::open` (and its FD/syscalls) when the
+    // file hasn't grown since the previous tail. The safety-scan fires this
+    // path for every known session every 15s, so most calls are no-ops.
+    let len = std::fs::metadata(&session.file)?.len();
     if len < session.file_offset {
         session.file_offset = 0;
     }
     if len == session.file_offset {
         return Ok(false);
     }
+
+    let mut f = File::open(&session.file)?;
     f.seek(SeekFrom::Start(session.file_offset))?;
-    let mut buf = Vec::with_capacity((len - session.file_offset) as usize);
-    f.read_to_end(&mut buf)?;
-    let last_nl = buf.iter().rposition(|&b| b == b'\n');
-    let Some(last_nl) = last_nl else {
-        return Ok(false);
-    };
+    let mut reader = BufReader::new(f);
+
+    let mut line = String::new();
+    let mut consumed: u64 = 0;
     let mut any = false;
-    for line in buf[..=last_nl].split(|&b| b == b'\n') {
-        if line.is_empty() {
-            continue;
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            break;
         }
-        if let Ok(s) = std::str::from_utf8(line) {
+        // EOF before a newline → partial trailing line. Leave the bytes in
+        // the file; the next tail will see them as a complete line.
+        if !line.ends_with('\n') {
+            break;
+        }
+        let s = line.trim_end_matches(['\r', '\n']);
+        if !s.is_empty() {
             match session.kind {
                 AgentKind::Claude => claude::update_from_line(session, s, live),
                 AgentKind::Codex => codex::update_from_line(session, s, live),
             }
             any = true;
         }
+        consumed += n as u64;
     }
-    session.file_offset += (last_nl + 1) as u64;
+    session.file_offset += consumed;
     Ok(any)
 }
 
 /// Initial pass: parse everything, do not contribute to live rate window.
+/// Parallelised so startup with hundreds of jsonls stays sub-second.
 pub fn initial_scan() -> Result<HashMap<PathBuf, Session>> {
-    let mut map: HashMap<PathBuf, Session> = HashMap::new();
-    for (kind, path) in list_files() {
-        let mut sess = Session::new(kind, path.clone());
-        let _ = tail(&mut sess, false);
-        map.insert(path, sess);
-    }
+    let map: HashMap<PathBuf, Session> = list_files()
+        .into_par_iter()
+        .map(|(kind, path)| {
+            let mut sess = Session::new(kind, path.clone());
+            let _ = tail(&mut sess, false);
+            (path, sess)
+        })
+        .collect();
     Ok(map)
 }

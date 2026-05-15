@@ -49,7 +49,9 @@ pub fn update_from_line(session: &mut Session, line: &str, live: bool) {
         }
         "turn_context" => {
             if session.model.is_none() {
-                session.model = payload.get("model").and_then(|v| v.as_str()).map(String::from);
+                if let Some(m) = payload.get("model").and_then(|v| v.as_str()) {
+                    session.set_model(m.to_string());
+                }
             }
             if session.cwd.is_none() {
                 session.cwd = payload.get("cwd").and_then(|v| v.as_str()).map(String::from);

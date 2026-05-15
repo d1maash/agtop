@@ -70,32 +70,35 @@ pub fn spawn(shared: Shared) -> Result<()> {
                 .filter(|(_, t)| now.duration_since(**t) >= debounce)
                 .map(|(p, _)| p.clone())
                 .collect();
-            if !ready.is_empty() {
-                let mut map = lock_shared(&shared);
-                for path in ready {
-                    pending.remove(&path);
-                    process_path(&path, &mut map);
-                }
+            for path in ready {
+                pending.remove(&path);
+                tail_one(&shared, &path);
             }
 
             if now.duration_since(last_safety) >= safety_scan {
                 last_safety = now;
-                let mut map = lock_shared(&shared);
-                let known: std::collections::HashSet<PathBuf> = map.keys().cloned().collect();
+
+                // Snapshot the known set under a brief lock; resolve new
+                // files outside the lock so the UI can keep rendering.
+                let known: std::collections::HashSet<PathBuf> = {
+                    let map = lock_shared(&shared);
+                    map.keys().cloned().collect()
+                };
+
                 for (kind, path) in sources::list_files() {
-                    if !known.contains(&path) {
-                        // new file appeared
-                        let mut sess = Session::new(kind, path.clone());
-                        let _ = sources::tail(&mut sess, true);
-                        map.insert(path, sess);
+                    if known.contains(&path) {
+                        continue;
                     }
+                    let mut sess = Session::new(kind, path.clone());
+                    let _ = sources::tail(&mut sess, true);
+                    lock_shared(&shared).insert(path, sess);
                 }
+
                 // Re-tail anything that grew, in case events were dropped.
-                let paths: Vec<PathBuf> = map.keys().cloned().collect();
-                for p in paths {
-                    if let Some(s) = map.get_mut(&p) {
-                        let _ = sources::tail(s, true);
-                    }
+                // `tail` short-circuits on metadata.len() == file_offset, so
+                // unchanged files cost one stat call (no open, no lock).
+                for p in &known {
+                    tail_one(&shared, p);
                 }
             }
         }
@@ -123,10 +126,21 @@ fn collect(ev: &notify::Event, pending: &mut HashMap<PathBuf, Instant>) {
     }
 }
 
-fn process_path(path: &PathBuf, map: &mut HashMap<PathBuf, Session>) {
-    let entry = map.entry(path.clone()).or_insert_with(|| {
-        let kind = sources::classify(path).unwrap_or(crate::model::AgentKind::Claude);
-        Session::new(kind, path.clone())
-    });
-    let _ = sources::tail(entry, true);
+/// Tail a single session without holding the shared map lock across IO.
+/// We `remove` the session, tail it, then `insert` it back. Both halves run
+/// under brief locks so the UI thread can render in between. Only this worker
+/// writes to the map, so the slot can't be filled by anyone else meanwhile.
+fn tail_one(shared: &Shared, path: &PathBuf) {
+    let mut sess = {
+        let mut map = lock_shared(shared);
+        match map.remove(path) {
+            Some(s) => s,
+            None => {
+                let kind = sources::classify(path).unwrap_or(crate::model::AgentKind::Claude);
+                Session::new(kind, path.clone())
+            }
+        }
+    };
+    let _ = sources::tail(&mut sess, true);
+    lock_shared(shared).insert(path.clone(), sess);
 }
