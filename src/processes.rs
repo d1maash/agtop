@@ -1,11 +1,13 @@
 use std::collections::HashSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime};
 use walkdir::WalkDir;
+
+#[cfg(unix)]
+use std::process::Command;
 
 /// Returns the set of session JSONL files whose owning CLI process is alive
 /// right now. Detection logic:
@@ -104,6 +106,12 @@ fn codex_session_cwd(path: &Path) -> Option<String> {
 
 /// CWDs of every running `claude`/`codex` CLI process. Excludes desktop
 /// Electron apps and helpers. Dedups.
+///
+/// Unix-only because the implementation shells out to `ps` and `lsof`.
+/// On non-unix targets this returns `None`, which causes
+/// `running_session_paths` to short-circuit and the UI to fall back to its
+/// mtime heuristic for the "running" filter.
+#[cfg(unix)]
 fn running_cli_cwds() -> Option<HashSet<PathBuf>> {
     let out = Command::new("ps")
         .args(["-A", "-o", "pid=,args="])
@@ -134,12 +142,15 @@ fn running_cli_cwds() -> Option<HashSet<PathBuf>> {
     Some(cwds)
 }
 
+#[cfg(not(unix))]
+fn running_cli_cwds() -> Option<HashSet<PathBuf>> {
+    None
+}
+
+#[cfg(unix)]
 fn is_cli_command(cmdline: &str) -> bool {
     let first = cmdline.split_whitespace().next().unwrap_or("");
-    let is_claude = (first.ends_with("/claude")
-        || first.ends_with("/claude.exe")
-        || first == "claude"
-        || first == "claude.exe")
+    let is_claude = (first.ends_with("/claude") || first == "claude")
         && !first.contains("/Claude.app/");
     let is_codex = (first.ends_with("/codex") || first == "codex")
         && !first.contains("/Codex.app/")
@@ -148,6 +159,7 @@ fn is_cli_command(cmdline: &str) -> bool {
     is_claude || is_codex
 }
 
+#[cfg(unix)]
 fn cwd_of(pid: u32) -> Option<PathBuf> {
     let out = Command::new("lsof")
         .args(["-p", &pid.to_string(), "-d", "cwd", "-Fn"])

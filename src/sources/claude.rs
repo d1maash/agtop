@@ -1,5 +1,6 @@
 use crate::model::Session;
-use chrono::{DateTime, Utc};
+use crate::sources::parse_ts;
+use chrono::Utc;
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -89,6 +90,3 @@ pub fn update_from_line(session: &mut Session, line: &str, live: bool) {
     }
 }
 
-fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(s).ok().map(|d| d.with_timezone(&Utc))
-}

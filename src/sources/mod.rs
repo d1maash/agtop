@@ -3,12 +3,19 @@ pub mod codex;
 
 use crate::model::{AgentKind, Session};
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
+
+pub fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|d| d.with_timezone(&Utc))
+}
 
 pub fn claude_root() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude").join("projects"))

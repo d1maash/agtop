@@ -1,4 +1,4 @@
-use crate::model::{AgentKind, Session};
+use crate::model::{AgentKind, Session, SessionView};
 use crate::sources;
 use anyhow::Result;
 use notify::event::ModifyKind;
@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 
 /// Immutable view of all known sessions. Published by the watcher thread,
 /// consumed by the UI. Cloning is an `Arc` bump — no session data copies.
-pub type Snapshot = Arc<Vec<Session>>;
+/// `SessionView` is the render-only projection of `Session`, so the per-event
+/// sample buffer doesn't get cloned every publish tick.
+pub type Snapshot = Arc<Vec<SessionView>>;
 
 /// Cell holding the latest published snapshot. The mutex is held only long
 /// enough to clone the inner `Arc`, so UI reads never wait on watcher work.
@@ -27,13 +29,13 @@ pub fn current(shared: &Shared) -> Snapshot {
 /// mutating in place.
 pub fn build_initial_state() -> (Shared, HashMap<PathBuf, Session>) {
     let map = sources::initial_scan().unwrap_or_default();
-    let snap: Vec<Session> = map.values().cloned().collect();
+    let snap: Vec<SessionView> = map.values().map(Session::view).collect();
     let shared = Arc::new(Mutex::new(Arc::new(snap)));
     (shared, map)
 }
 
 fn publish(shared: &Shared, map: &HashMap<PathBuf, Session>) {
-    let snap: Vec<Session> = map.values().cloned().collect();
+    let snap: Vec<SessionView> = map.values().map(Session::view).collect();
     let new = Arc::new(snap);
     *shared.lock().unwrap_or_else(|p| p.into_inner()) = new;
 }

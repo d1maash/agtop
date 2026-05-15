@@ -1,4 +1,4 @@
-use crate::model::{AgentKind, Session};
+use crate::model::{AgentKind, SessionView};
 use crate::watcher::{current, Shared};
 use anyhow::Result;
 use chrono::Utc;
@@ -73,11 +73,11 @@ impl App {
     }
 
     /// Returns the published snapshot plus a sorted+filtered list of refs
-    /// into it. No Session bodies are copied here — the Arc bump is the only
-    /// shared-state work, and sorting operates on `&Session`.
-    fn view<'a>(&self, snap: &'a [Session]) -> Vec<&'a Session> {
+    /// into it. No session bodies are copied here — the Arc bump is the only
+    /// shared-state work, and sorting operates on `&SessionView`.
+    fn view<'a>(&self, snap: &'a [SessionView]) -> Vec<&'a SessionView> {
         let open = self.open_files.snapshot();
-        let mut v: Vec<&Session> = snap.iter().collect();
+        let mut v: Vec<&SessionView> = snap.iter().collect();
         if !self.show_inactive {
             match open.as_ref() {
                 Some(open_set) => v.retain(|s| open_set.contains(&s.file)),
@@ -99,18 +99,18 @@ impl App {
     }
 }
 
-fn sort_sessions(sessions: &mut [&Session], by: SortBy) {
+fn sort_sessions(sessions: &mut [&SessionView], by: SortBy) {
     match by {
         SortBy::LastActivity => sessions.sort_by(|a, b| b.last_activity.cmp(&a.last_activity)),
         SortBy::Tokens => sessions.sort_by(|a, b| b.tokens.total().cmp(&a.tokens.total())),
         SortBy::Project => sessions.sort_by(|a, b| a.project_name().cmp(&b.project_name())),
         SortBy::Cost => sessions.sort_by(|a, b| {
-            b.cost_usd()
+            b.cost_usd
                 .unwrap_or(0.0)
-                .partial_cmp(&a.cost_usd().unwrap_or(0.0))
+                .partial_cmp(&a.cost_usd.unwrap_or(0.0))
                 .unwrap_or(std::cmp::Ordering::Equal)
         }),
-        SortBy::Rate => sessions.sort_by(|a, b| b.tokens_per_min().cmp(&a.tokens_per_min())),
+        SortBy::Rate => sessions.sort_by(|a, b| b.tokens_per_min.cmp(&a.tokens_per_min)),
         SortBy::Source => sessions.sort_by(|a, b| {
             (a.kind.label(), std::cmp::Reverse(a.last_activity))
                 .cmp(&(b.kind.label(), std::cmp::Reverse(b.last_activity)))
@@ -153,7 +153,7 @@ fn main_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, shared: Shared) 
     Ok(())
 }
 
-fn draw(f: &mut ratatui::Frame, app: &mut App, sessions: &[&Session], hidden: usize) {
+fn draw(f: &mut ratatui::Frame, app: &mut App, sessions: &[&SessionView], hidden: usize) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -168,13 +168,13 @@ fn draw(f: &mut ratatui::Frame, app: &mut App, sessions: &[&Session], hidden: us
     draw_footer(f, chunks[2], app);
 }
 
-fn draw_header(f: &mut ratatui::Frame, area: ratatui::layout::Rect, sessions: &[&Session]) {
+fn draw_header(f: &mut ratatui::Frame, area: ratatui::layout::Rect, sessions: &[&SessionView]) {
     let total_tokens: u64 = sessions.iter().map(|s| s.tokens.total()).sum();
-    let total_cost: f64 = sessions.iter().filter_map(|s| s.cost_usd()).sum();
+    let total_cost: f64 = sessions.iter().filter_map(|s| s.cost_usd).sum();
     let active = sessions.iter().filter(|s| is_active(s)).count();
     let claude_n = sessions.iter().filter(|s| s.kind == AgentKind::Claude).count();
     let codex_n = sessions.iter().filter(|s| s.kind == AgentKind::Codex).count();
-    let live_rate: u64 = sessions.iter().map(|s| s.tokens_per_min()).sum();
+    let live_rate: u64 = sessions.iter().map(|s| s.tokens_per_min).sum();
 
     let line = Line::from(vec![
         Span::styled("agtop", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
@@ -202,7 +202,7 @@ fn draw_table(
     f: &mut ratatui::Frame,
     area: ratatui::layout::Rect,
     app: &mut App,
-    sessions: &[&Session],
+    sessions: &[&SessionView],
     hidden: usize,
 ) {
     let header_cells = [
@@ -224,14 +224,14 @@ fn draw_table(
             let status_text = if active { "● active" } else { "  idle" };
             let status_color = if active { Color::Green } else { Color::DarkGray };
 
-            let rate = s.tokens_per_min();
+            let rate = s.tokens_per_min;
             let rate_cell = if rate > 0 {
                 Cell::from(fmt_num(rate)).style(Style::default().fg(Color::Yellow))
             } else {
                 Cell::from("·").style(Style::default().fg(Color::DarkGray))
             };
 
-            let cost_cell = match s.cost_usd() {
+            let cost_cell = match s.cost_usd {
                 Some(c) if c >= 0.01 => Cell::from(format!("${:.2}", c))
                     .style(Style::default().fg(Color::LightGreen)),
                 Some(_) => Cell::from("<$0.01").style(Style::default().fg(Color::DarkGray)),
@@ -318,7 +318,7 @@ fn chip(label: &str) -> Span<'_> {
     )
 }
 
-fn is_active(s: &Session) -> bool {
+fn is_active(s: &SessionView) -> bool {
     s.last_activity
         .map(|t| (Utc::now() - t).num_seconds() <= ACTIVE_WINDOW_SECS)
         .unwrap_or(false)
@@ -329,7 +329,7 @@ fn is_active(s: &Session) -> bool {
 /// both because file mtime captures activity that hasn't been parsed yet
 /// (e.g. between watcher ticks), while last_activity covers cases where
 /// the OS reports a stale mtime.
-fn is_running(s: &Session) -> bool {
+fn is_running(s: &SessionView) -> bool {
     if is_active(s) {
         return true;
     }
@@ -341,7 +341,7 @@ fn is_running(s: &Session) -> bool {
         .unwrap_or(false)
 }
 
-fn format_ago(s: &Session) -> String {
+fn format_ago(s: &SessionView) -> String {
     let Some(t) = s.last_activity else {
         return "-".into();
     };

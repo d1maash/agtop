@@ -137,4 +137,53 @@ impl Session {
                 + (t.cache_creation as f64) * p.cache_write / per,
         )
     }
+
+    /// Render-only projection: drops `samples` (the unbounded VecDeque that
+    /// makes `Session::clone` expensive) and pre-resolves the time-derived
+    /// quantities the UI needs. The watcher hands a `Vec<SessionView>` to the
+    /// UI every publish tick (~250 ms), so cloning each session's sample
+    /// buffer would do real allocation work for no visible benefit.
+    pub fn view(&self) -> SessionView {
+        SessionView {
+            kind: self.kind,
+            id: self.id.clone(),
+            file: self.file.clone(),
+            cwd: self.cwd.clone(),
+            model: self.model.clone(),
+            last_activity: self.last_activity,
+            tokens: self.tokens,
+            tokens_per_min: self.tokens_per_min(),
+            cost_usd: self.cost_usd(),
+        }
+    }
+}
+
+/// Snapshot of a `Session` for UI rendering. Cheap to clone — no `VecDeque`,
+/// no pricing pointer, no per-event sample history. Times that depend on
+/// "now" (rate window, cost) are frozen at the moment of construction.
+#[derive(Debug, Clone)]
+pub struct SessionView {
+    pub kind: AgentKind,
+    pub id: String,
+    pub file: PathBuf,
+    pub cwd: Option<String>,
+    pub model: Option<String>,
+    pub last_activity: Option<DateTime<Utc>>,
+    pub tokens: TokenStats,
+    pub tokens_per_min: u64,
+    pub cost_usd: Option<f64>,
+}
+
+impl SessionView {
+    pub fn short_id(&self) -> String {
+        self.id.chars().take(8).collect()
+    }
+
+    pub fn project_name(&self) -> String {
+        self.cwd
+            .as_deref()
+            .and_then(|p| p.rsplit('/').next())
+            .unwrap_or("-")
+            .to_string()
+    }
 }
