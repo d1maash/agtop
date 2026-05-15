@@ -61,20 +61,13 @@ fn running_cli_cwds() -> Option<HashSet<PathBuf>> {
             Ok(p) => p,
             Err(_) => continue,
         };
-        let rest = rest.trim();
-        if is_cli_command(rest) {
+        if is_cli_command(rest.trim()) {
             pids.push(pid);
-        }
-        if std::env::var("AGTOP_DEBUG").is_ok() && rest.starts_with("claude") {
-            eprintln!("[debug] pid={} cmd={:?} matched={}", pid, rest, is_cli_command(rest));
         }
     }
     let mut cwds = HashSet::new();
     for pid in pids {
         if let Some(cwd) = cwd_of(pid) {
-            if std::env::var("AGTOP_DEBUG").is_ok() {
-                eprintln!("[debug] pid={} cwd={}", pid, cwd.display());
-            }
             cwds.insert(cwd);
         }
     }
