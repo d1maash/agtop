@@ -20,8 +20,6 @@ struct TokenUsage {
     output_tokens: u64,
     #[serde(default)]
     cached_input_tokens: u64,
-    #[serde(default)]
-    reasoning_output_tokens: u64,
 }
 
 pub fn update_from_line(session: &mut Session, line: &str, live: bool) {
@@ -62,12 +60,15 @@ pub fn update_from_line(session: &mut Session, line: &str, live: bool) {
                 if let Some(info) = payload.get("info") {
                     if let Some(last_usage) = info.get("last_token_usage") {
                         if let Ok(u) = serde_json::from_value::<TokenUsage>(last_usage.clone()) {
+                            // OpenAI's `output_tokens` already includes
+                            // `reasoning_output_tokens`, so don't add reasoning
+                            // again — that would double-count it both in the
+                            // total and in the cost.
                             let net_input = u.input_tokens.saturating_sub(u.cached_input_tokens);
-                            let added = u.input_tokens + u.output_tokens + u.reasoning_output_tokens;
+                            let added = u.input_tokens + u.output_tokens;
                             session.tokens.input += net_input;
                             session.tokens.output += u.output_tokens;
                             session.tokens.cache_read += u.cached_input_tokens;
-                            session.tokens.reasoning += u.reasoning_output_tokens;
                             session.turn_count += 1;
                             if live {
                                 session.push_sample(ts.unwrap_or_else(Utc::now), added);

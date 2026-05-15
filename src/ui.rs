@@ -76,7 +76,7 @@ impl App {
     fn snapshot(&mut self) -> (Vec<Session>, usize) {
         let open: Option<std::collections::HashSet<std::path::PathBuf>> =
             self.open_files.get().cloned();
-        let map = self.shared.lock().unwrap();
+        let map = crate::watcher::lock_shared(&self.shared);
         let total = map.len();
         let mut v: Vec<Session> = map.values().cloned().collect();
         if !self.show_inactive {
@@ -113,7 +113,8 @@ fn sort_sessions(sessions: &mut [Session], by: SortBy) {
         }),
         SortBy::Rate => sessions.sort_by(|a, b| b.tokens_per_min().cmp(&a.tokens_per_min())),
         SortBy::Source => sessions.sort_by(|a, b| {
-            (a.kind.label(), b.last_activity).cmp(&(b.kind.label(), a.last_activity))
+            (a.kind.label(), std::cmp::Reverse(a.last_activity))
+                .cmp(&(b.kind.label(), std::cmp::Reverse(b.last_activity)))
         }),
     }
 }

@@ -41,8 +41,15 @@ pub fn update_from_line(session: &mut Session, line: &str, live: bool) {
         Ok(v) => v,
         Err(_) => return,
     };
-    if session.id.starts_with(|c: char| !c.is_ascii_hexdigit()) || session.id.contains('-') {
-        // overwrite filename-derived id with real sessionId
+    // Overwrite the filename-derived id with the first real sessionId we see,
+    // then leave it alone — resume/fork lines can carry a different sessionId
+    // and we don't want the displayed id to flip every tick.
+    let filename_stem = session
+        .file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if session.id == filename_stem {
         if let Some(id) = parsed.session_id {
             session.id = id;
         }

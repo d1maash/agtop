@@ -15,7 +15,7 @@
 │ codex   019e1d9b   joinway-learn-ai    gpt-5.5            8.5M          ·    $0.86  1d     idle  │
 │ ...                                                                                            │
 └────────────────────────────────────────────────────────────────────────────────────────┘
- q  quit   ↑↓/jk  nav   t  tokens   c  cost   m  rate   a  activity   p  project   A  show:24h
+ q  quit   ↑↓/jk  nav   t  tokens   c  cost   m  rate   a  activity   p  project   s  source   A  show:running
 ```
 
 ## Install
@@ -60,7 +60,8 @@ agtop --version
 | `m`       | Sort by current rate (tokens/min)             |
 | `a`       | Sort by last activity                         |
 | `p`       | Sort by project name                          |
-| `A`       | Toggle: show all sessions vs. last 24h only   |
+| `s`       | Sort by source (claude / codex)               |
+| `A`       | Toggle: show only running sessions vs. all    |
 
 ## Columns
 

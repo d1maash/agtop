@@ -5,11 +5,18 @@ use notify::event::ModifyKind;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
 pub type Shared = Arc<Mutex<HashMap<PathBuf, Session>>>;
+
+/// Lock a `Shared` without crashing on poisoning. A panic inside one tail
+/// pass shouldn't take down the whole process — we'd rather keep displaying
+/// the last good snapshot and let the next tick recover.
+pub fn lock_shared(shared: &Shared) -> MutexGuard<'_, HashMap<PathBuf, Session>> {
+    shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 pub fn build_initial_state() -> Shared {
     let map = sources::initial_scan().unwrap_or_default();
@@ -64,7 +71,7 @@ pub fn spawn(shared: Shared) -> Result<()> {
                 .map(|(p, _)| p.clone())
                 .collect();
             if !ready.is_empty() {
-                let mut map = shared.lock().unwrap();
+                let mut map = lock_shared(&shared);
                 for path in ready {
                     pending.remove(&path);
                     process_path(&path, &mut map);
@@ -73,7 +80,7 @@ pub fn spawn(shared: Shared) -> Result<()> {
 
             if now.duration_since(last_safety) >= safety_scan {
                 last_safety = now;
-                let mut map = shared.lock().unwrap();
+                let mut map = lock_shared(&shared);
                 let known: std::collections::HashSet<PathBuf> = map.keys().cloned().collect();
                 for (kind, path) in sources::list_files() {
                     if !known.contains(&path) {
