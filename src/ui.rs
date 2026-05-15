@@ -1,5 +1,5 @@
 use crate::model::{AgentKind, Session};
-use crate::watcher::Shared;
+use crate::watcher::{current, Shared};
 use anyhow::Result;
 use chrono::Utc;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -56,7 +56,7 @@ struct App {
     state: TableState,
     show_inactive: bool,
     shared: Shared,
-    open_files: crate::processes::OpenFilesCache,
+    open_files: crate::processes::OpenFilesWatcher,
 }
 
 impl App {
@@ -68,25 +68,24 @@ impl App {
             state,
             show_inactive: false,
             shared,
-            open_files: crate::processes::OpenFilesCache::new(),
+            open_files: crate::processes::OpenFilesWatcher::spawn(),
         }
     }
 
-    /// Returns (visible_sessions, total_count_before_filter).
-    fn snapshot(&mut self) -> (Vec<Session>, usize) {
-        let open: Option<std::collections::HashSet<std::path::PathBuf>> =
-            self.open_files.get().cloned();
-        let map = self.shared.lock().unwrap();
-        let total = map.len();
-        let mut v: Vec<Session> = map.values().cloned().collect();
+    /// Returns the published snapshot plus a sorted+filtered list of refs
+    /// into it. No Session bodies are copied here — the Arc bump is the only
+    /// shared-state work, and sorting operates on `&Session`.
+    fn view<'a>(&self, snap: &'a [Session]) -> Vec<&'a Session> {
+        let open = self.open_files.snapshot();
+        let mut v: Vec<&Session> = snap.iter().collect();
         if !self.show_inactive {
             match open.as_ref() {
                 Some(open_set) => v.retain(|s| open_set.contains(&s.file)),
-                None => v.retain(is_running),
+                None => v.retain(|s| is_running(s)),
             }
         }
         sort_sessions(&mut v, self.sort);
-        (v, total)
+        v
     }
 
     fn move_cursor(&mut self, delta: isize, len: usize) {
@@ -100,7 +99,7 @@ impl App {
     }
 }
 
-fn sort_sessions(sessions: &mut [Session], by: SortBy) {
+fn sort_sessions(sessions: &mut [&Session], by: SortBy) {
     match by {
         SortBy::LastActivity => sessions.sort_by(|a, b| b.last_activity.cmp(&a.last_activity)),
         SortBy::Tokens => sessions.sort_by(|a, b| b.tokens.total().cmp(&a.tokens.total())),
@@ -113,7 +112,8 @@ fn sort_sessions(sessions: &mut [Session], by: SortBy) {
         }),
         SortBy::Rate => sessions.sort_by(|a, b| b.tokens_per_min().cmp(&a.tokens_per_min())),
         SortBy::Source => sessions.sort_by(|a, b| {
-            (a.kind.label(), b.last_activity).cmp(&(b.kind.label(), a.last_activity))
+            (a.kind.label(), std::cmp::Reverse(a.last_activity))
+                .cmp(&(b.kind.label(), std::cmp::Reverse(b.last_activity)))
         }),
     }
 }
@@ -122,7 +122,9 @@ fn main_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, shared: Shared) 
     let mut app = App::new(shared);
 
     loop {
-        let (sessions, total) = app.snapshot();
+        let snap = current(&app.shared);
+        let total = snap.len();
+        let sessions = app.view(&snap);
         let hidden = total.saturating_sub(sessions.len());
         terminal.draw(|f| draw(f, &mut app, &sessions, hidden))?;
 
@@ -131,7 +133,7 @@ fn main_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, shared: Shared) 
                 if k.kind != KeyEventKind::Press {
                     continue;
                 }
-                let len = app.snapshot().0.len();
+                let len = sessions.len();
                 match k.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
                     KeyCode::Down | KeyCode::Char('j') => app.move_cursor(1, len),
@@ -151,7 +153,7 @@ fn main_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, shared: Shared) 
     Ok(())
 }
 
-fn draw(f: &mut ratatui::Frame, app: &mut App, sessions: &[Session], hidden: usize) {
+fn draw(f: &mut ratatui::Frame, app: &mut App, sessions: &[&Session], hidden: usize) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -166,7 +168,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App, sessions: &[Session], hidden: usi
     draw_footer(f, chunks[2], app);
 }
 
-fn draw_header(f: &mut ratatui::Frame, area: ratatui::layout::Rect, sessions: &[Session]) {
+fn draw_header(f: &mut ratatui::Frame, area: ratatui::layout::Rect, sessions: &[&Session]) {
     let total_tokens: u64 = sessions.iter().map(|s| s.tokens.total()).sum();
     let total_cost: f64 = sessions.iter().filter_map(|s| s.cost_usd()).sum();
     let active = sessions.iter().filter(|s| is_active(s)).count();
@@ -200,7 +202,7 @@ fn draw_table(
     f: &mut ratatui::Frame,
     area: ratatui::layout::Rect,
     app: &mut App,
-    sessions: &[Session],
+    sessions: &[&Session],
     hidden: usize,
 ) {
     let header_cells = [

@@ -1,45 +1,105 @@
 use std::collections::HashSet;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant, SystemTime};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, SystemTime};
+use walkdir::WalkDir;
 
 /// Returns the set of session JSONL files whose owning CLI process is alive
 /// right now. Detection logic:
 ///   1. Find running `claude` / `codex` CLI processes via `ps -A -o args`.
 ///   2. For each, read its working directory via `lsof -p PID -d cwd`.
-///   3. Map cwd → ~/.claude/projects/<encoded-cwd>/ and pick the newest
-///      JSONL in that directory (that's the session this CLI is writing to).
-///   4. For Codex, also match parsed `session.cwd` to running CLI cwds.
+///   3. Map cwd → ~/.claude/projects/<encoded-cwd>/ and pick recently-touched
+///      JSONLs in that directory (Claude Code).
+///   4. For Codex, scan recently-touched rollout-*.jsonl files and match each
+///      file's `session_meta.cwd` against the set of running CLI cwds.
 ///
 /// Returns None if `ps` or `lsof` is unavailable so the caller can fall back.
-/// Sessions whose cwd has a live CLI process AND whose file was touched
-/// in the recent past (30 min). Multiple concurrent terminals in the same
-/// cwd produce multiple paths.
+/// Multiple concurrent terminals in the same cwd produce multiple paths.
 pub fn running_session_paths() -> Option<HashSet<PathBuf>> {
     let cwds = running_cli_cwds()?;
-    let claude_root = crate::sources::claude_root()?;
     let mut paths = HashSet::new();
     let window = Duration::from_secs(30 * 60);
     let now = SystemTime::now();
-    for cwd in &cwds {
-        let encoded = encode_cwd_for_claude(cwd);
-        let project_dir = claude_root.join(&encoded);
-        let Ok(entries) = std::fs::read_dir(&project_dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+
+    if let Some(claude_root) = crate::sources::claude_root() {
+        for cwd in &cwds {
+            let encoded = encode_cwd_for_claude(cwd);
+            let project_dir = claude_root.join(&encoded);
+            let Ok(entries) = std::fs::read_dir(&project_dir) else {
                 continue;
-            }
-            let Ok(meta) = entry.metadata() else { continue };
-            let Ok(modified) = meta.modified() else { continue };
-            if now.duration_since(modified).map_or(false, |d| d <= window) {
-                paths.insert(p);
+            };
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                let Ok(meta) = entry.metadata() else { continue };
+                let Ok(modified) = meta.modified() else { continue };
+                if now.duration_since(modified).map_or(false, |d| d <= window) {
+                    paths.insert(p);
+                }
             }
         }
     }
+
+    if let Some(codex_root) = crate::sources::codex_root() {
+        if codex_root.exists() {
+            for entry in WalkDir::new(&codex_root)
+                .max_depth(5)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                let p = entry.path();
+                if p.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                let name = match p.file_name().and_then(|s| s.to_str()) {
+                    Some(n) if n.starts_with("rollout-") => n,
+                    _ => continue,
+                };
+                let _ = name;
+                let Ok(meta) = entry.metadata() else { continue };
+                let Ok(modified) = meta.modified() else { continue };
+                if now.duration_since(modified).map_or(true, |d| d > window) {
+                    continue;
+                }
+                if let Some(file_cwd) = codex_session_cwd(p) {
+                    if cwds.contains(Path::new(&file_cwd)) {
+                        paths.insert(p.to_path_buf());
+                    }
+                }
+            }
+        }
+    }
+
     Some(paths)
+}
+
+/// Read the first few lines of a Codex rollout and extract `session_meta.cwd`.
+fn codex_session_cwd(path: &Path) -> Option<String> {
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut buf = [0u8; 8192];
+    let n = f.read(&mut buf).ok()?;
+    let text = std::str::from_utf8(&buf[..n]).ok()?;
+    for line in text.lines().take(8) {
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if v.get("type").and_then(|t| t.as_str()) == Some("session_meta") {
+            if let Some(cwd) = v
+                .get("payload")
+                .and_then(|p| p.get("cwd"))
+                .and_then(|c| c.as_str())
+            {
+                return Some(cwd.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// CWDs of every running `claude`/`codex` CLI process. Excludes desktop
@@ -61,20 +121,13 @@ fn running_cli_cwds() -> Option<HashSet<PathBuf>> {
             Ok(p) => p,
             Err(_) => continue,
         };
-        let rest = rest.trim();
-        if is_cli_command(rest) {
+        if is_cli_command(rest.trim()) {
             pids.push(pid);
-        }
-        if std::env::var("AGTOP_DEBUG").is_ok() && rest.starts_with("claude") {
-            eprintln!("[debug] pid={} cmd={:?} matched={}", pid, rest, is_cli_command(rest));
         }
     }
     let mut cwds = HashSet::new();
     for pid in pids {
         if let Some(cwd) = cwd_of(pid) {
-            if std::env::var("AGTOP_DEBUG").is_ok() {
-                eprintln!("[debug] pid={} cwd={}", pid, cwd.display());
-            }
             cwds.insert(cwd);
         }
     }
@@ -109,32 +162,39 @@ fn cwd_of(pid: u32) -> Option<PathBuf> {
     None
 }
 
-/// Claude Code names its project dirs by replacing every '/' in the cwd
-/// with '-' (the leading slash becomes a leading dash too).
+/// Claude Code names its project dirs by replacing every '/' AND every '.'
+/// in the cwd with '-' (the leading slash becomes a leading dash too). So
+/// `/Users/foo/my.app` → `-Users-foo-my-app`.
 fn encode_cwd_for_claude(cwd: &Path) -> String {
-    cwd.to_string_lossy().replace('/', "-")
+    cwd.to_string_lossy().replace(['/', '.'], "-")
 }
 
-pub struct OpenFilesCache {
-    files: Option<HashSet<PathBuf>>,
-    last_refresh: Instant,
-    ttl: Duration,
+/// Shared snapshot of "which jsonl files are owned by a running CLI right now."
+/// Refreshed on a dedicated thread because `running_session_paths()` shells
+/// out to `ps` and `lsof` and walks the codex sessions tree — doing that in
+/// the UI thread caused visible freezes every refresh tick.
+///
+/// `None` means detection isn't available (no `ps`/`lsof`); the UI falls back
+/// to its mtime heuristic. The inner `HashSet` is cheap to clone (paths only)
+/// and we hand out clones so the UI never holds the lock across rendering.
+pub struct OpenFilesWatcher {
+    inner: Arc<Mutex<Option<HashSet<PathBuf>>>>,
 }
 
-impl OpenFilesCache {
-    pub fn new() -> Self {
-        Self {
-            files: running_session_paths(),
-            last_refresh: Instant::now(),
-            ttl: Duration::from_secs(2),
-        }
+impl OpenFilesWatcher {
+    pub fn spawn() -> Self {
+        let inner = Arc::new(Mutex::new(running_session_paths()));
+        let bg = Arc::clone(&inner);
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_secs(2));
+            let next = running_session_paths();
+            let mut guard = bg.lock().unwrap_or_else(|p| p.into_inner());
+            *guard = next;
+        });
+        Self { inner }
     }
 
-    pub fn get(&mut self) -> Option<&HashSet<PathBuf>> {
-        if self.last_refresh.elapsed() >= self.ttl {
-            self.files = running_session_paths();
-            self.last_refresh = Instant::now();
-        }
-        self.files.as_ref()
+    pub fn snapshot(&self) -> Option<HashSet<PathBuf>> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 }

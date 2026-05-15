@@ -65,8 +65,8 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
-    let shared = watcher::build_initial_state();
-    watcher::spawn(shared.clone())?;
+    let (shared, map) = watcher::build_initial_state();
+    watcher::spawn(shared.clone(), map)?;
     ui::run(shared)
 }
 

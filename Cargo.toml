@@ -1,6 +1,6 @@
 [package]
 name = "agtop"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "htop-like TUI for local AI coding agent sessions (Claude Code, Codex)"
 license = "MIT"
@@ -25,6 +25,7 @@ clap = { version = "4", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5"
 notify = "6"
+rayon = "1"
 
 [profile.release]
 lto = "thin"
