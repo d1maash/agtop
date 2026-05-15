@@ -46,7 +46,7 @@ fn main() -> Result<()> {
     if cli.once {
         let map = sources::initial_scan()?;
         let mut sessions: Vec<_> = map.into_values().collect();
-        sessions.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
+        sessions.sort_by_key(|s| std::cmp::Reverse(s.last_activity));
         println!(
             "{:<7} {:<10} {:<24} {:<18} {:>10} {:>10} {:>10} {:>10} {:>9}",
             "SRC", "ID", "PROJECT", "MODEL", "IN", "OUT", "CACHE", "TOTAL", "$"

@@ -66,25 +66,21 @@ pub fn update_from_line(session: &mut Session, line: &str, live: bool) {
                     .map(String::from);
             }
         }
-        "event_msg" => {
-            if payload.get("type").and_then(|v| v.as_str()) == Some("token_count") {
-                if let Some(info) = payload.get("info") {
-                    if let Some(last_usage) = info.get("last_token_usage") {
-                        if let Ok(u) = serde_json::from_value::<TokenUsage>(last_usage.clone()) {
-                            // OpenAI's `output_tokens` already includes
-                            // `reasoning_output_tokens`, so don't add reasoning
-                            // again — that would double-count it both in the
-                            // total and in the cost.
-                            let net_input = u.input_tokens.saturating_sub(u.cached_input_tokens);
-                            let added = u.input_tokens + u.output_tokens;
-                            session.tokens.input += net_input;
-                            session.tokens.output += u.output_tokens;
-                            session.tokens.cache_read += u.cached_input_tokens;
-                            session.turn_count += 1;
-                            if live {
-                                session.push_sample(ts.unwrap_or_else(Utc::now), added);
-                            }
-                        }
+        "event_msg" if payload.get("type").and_then(|v| v.as_str()) == Some("token_count") => {
+            if let Some(last_usage) = payload.get("info").and_then(|i| i.get("last_token_usage")) {
+                if let Ok(u) = serde_json::from_value::<TokenUsage>(last_usage.clone()) {
+                    // OpenAI's `output_tokens` already includes
+                    // `reasoning_output_tokens`, so don't add reasoning
+                    // again — that would double-count it both in the
+                    // total and in the cost.
+                    let net_input = u.input_tokens.saturating_sub(u.cached_input_tokens);
+                    let added = u.input_tokens + u.output_tokens;
+                    session.tokens.input += net_input;
+                    session.tokens.output += u.output_tokens;
+                    session.tokens.cache_read += u.cached_input_tokens;
+                    session.turn_count += 1;
+                    if live {
+                        session.push_sample(ts.unwrap_or_else(Utc::now), added);
                     }
                 }
             }

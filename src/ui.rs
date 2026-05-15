@@ -101,8 +101,8 @@ impl App {
 
 fn sort_sessions(sessions: &mut [&SessionView], by: SortBy) {
     match by {
-        SortBy::LastActivity => sessions.sort_by(|a, b| b.last_activity.cmp(&a.last_activity)),
-        SortBy::Tokens => sessions.sort_by(|a, b| b.tokens.total().cmp(&a.tokens.total())),
+        SortBy::LastActivity => sessions.sort_by_key(|s| std::cmp::Reverse(s.last_activity)),
+        SortBy::Tokens => sessions.sort_by_key(|s| std::cmp::Reverse(s.tokens.total())),
         SortBy::Project => sessions.sort_by_key(|a| a.project_name()),
         SortBy::Cost => sessions.sort_by(|a, b| {
             b.cost_usd
@@ -110,7 +110,7 @@ fn sort_sessions(sessions: &mut [&SessionView], by: SortBy) {
                 .partial_cmp(&a.cost_usd.unwrap_or(0.0))
                 .unwrap_or(std::cmp::Ordering::Equal)
         }),
-        SortBy::Rate => sessions.sort_by(|a, b| b.tokens_last_60s.cmp(&a.tokens_last_60s)),
+        SortBy::Rate => sessions.sort_by_key(|s| std::cmp::Reverse(s.tokens_last_60s)),
         SortBy::Source => sessions.sort_by(|a, b| {
             (a.kind.label(), std::cmp::Reverse(a.last_activity))
                 .cmp(&(b.kind.label(), std::cmp::Reverse(b.last_activity)))
