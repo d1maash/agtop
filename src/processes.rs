@@ -2,7 +2,9 @@ use std::collections::HashSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant, SystemTime};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, SystemTime};
 use walkdir::WalkDir;
 
 /// Returns the set of session JSONL files whose owning CLI process is alive
@@ -167,26 +169,32 @@ fn encode_cwd_for_claude(cwd: &Path) -> String {
     cwd.to_string_lossy().replace(['/', '.'], "-")
 }
 
-pub struct OpenFilesCache {
-    files: Option<HashSet<PathBuf>>,
-    last_refresh: Instant,
-    ttl: Duration,
+/// Shared snapshot of "which jsonl files are owned by a running CLI right now."
+/// Refreshed on a dedicated thread because `running_session_paths()` shells
+/// out to `ps` and `lsof` and walks the codex sessions tree — doing that in
+/// the UI thread caused visible freezes every refresh tick.
+///
+/// `None` means detection isn't available (no `ps`/`lsof`); the UI falls back
+/// to its mtime heuristic. The inner `HashSet` is cheap to clone (paths only)
+/// and we hand out clones so the UI never holds the lock across rendering.
+pub struct OpenFilesWatcher {
+    inner: Arc<Mutex<Option<HashSet<PathBuf>>>>,
 }
 
-impl OpenFilesCache {
-    pub fn new() -> Self {
-        Self {
-            files: running_session_paths(),
-            last_refresh: Instant::now(),
-            ttl: Duration::from_secs(2),
-        }
+impl OpenFilesWatcher {
+    pub fn spawn() -> Self {
+        let inner = Arc::new(Mutex::new(running_session_paths()));
+        let bg = Arc::clone(&inner);
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_secs(2));
+            let next = running_session_paths();
+            let mut guard = bg.lock().unwrap_or_else(|p| p.into_inner());
+            *guard = next;
+        });
+        Self { inner }
     }
 
-    pub fn get(&mut self) -> Option<&HashSet<PathBuf>> {
-        if self.last_refresh.elapsed() >= self.ttl {
-            self.files = running_session_paths();
-            self.last_refresh = Instant::now();
-        }
-        self.files.as_ref()
+    pub fn snapshot(&self) -> Option<HashSet<PathBuf>> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 }
