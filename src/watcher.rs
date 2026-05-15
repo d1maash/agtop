@@ -4,7 +4,7 @@ use anyhow::Result;
 use notify::event::ModifyKind;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -49,11 +49,12 @@ pub fn spawn(shared: Shared, mut map: HashMap<PathBuf, Session>) -> Result<()> {
     let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |res| {
         let _ = tx.send(res);
     })?;
-    for root in [sources::claude_root(), sources::codex_root()] {
-        if let Some(p) = root {
-            if p.exists() {
-                let _ = watcher.watch(&p, RecursiveMode::Recursive);
-            }
+    for p in [sources::claude_root(), sources::codex_root()]
+        .into_iter()
+        .flatten()
+    {
+        if p.exists() {
+            let _ = watcher.watch(&p, RecursiveMode::Recursive);
         }
     }
 
@@ -105,10 +106,10 @@ pub fn spawn(shared: Shared, mut map: HashMap<PathBuf, Session>) -> Result<()> {
                 last_safety = now;
 
                 for (kind, path) in sources::list_files() {
-                    if !map.contains_key(&path) {
-                        let mut sess = Session::new(kind, path.clone());
+                    if let std::collections::hash_map::Entry::Vacant(e) = map.entry(path.clone()) {
+                        let mut sess = Session::new(kind, path);
                         let _ = sources::tail(&mut sess, true);
-                        map.insert(path, sess);
+                        e.insert(sess);
                         dirty = true;
                     }
                 }
@@ -155,10 +156,10 @@ fn collect(ev: &notify::Event, pending: &mut HashMap<PathBuf, Instant>) {
     }
 }
 
-fn tail_path(map: &mut HashMap<PathBuf, Session>, path: &PathBuf) -> bool {
-    let entry = map.entry(path.clone()).or_insert_with(|| {
+fn tail_path(map: &mut HashMap<PathBuf, Session>, path: &Path) -> bool {
+    let entry = map.entry(path.to_path_buf()).or_insert_with(|| {
         let kind = sources::classify(path).unwrap_or(AgentKind::Claude);
-        Session::new(kind, path.clone())
+        Session::new(kind, path.to_path_buf())
     });
     sources::tail(entry, true).unwrap_or(false)
 }

@@ -36,14 +36,13 @@ pub fn classify(path: &Path) -> Option<AgentKind> {
         }
     }
     if let Some(root) = codex_root() {
-        if p.starts_with(&root.to_string_lossy().to_string()) {
-            if path
+        if p.starts_with(&root.to_string_lossy().to_string())
+            && path
                 .file_name()
                 .and_then(|s| s.to_str())
-                .map_or(false, |n| n.starts_with("rollout-"))
-            {
-                return Some(AgentKind::Codex);
-            }
+                .is_some_and(|n| n.starts_with("rollout-"))
+        {
+            return Some(AgentKind::Codex);
         }
     }
     None
@@ -51,7 +50,10 @@ pub fn classify(path: &Path) -> Option<AgentKind> {
 
 pub fn list_files() -> Vec<(AgentKind, PathBuf)> {
     let mut out = Vec::new();
-    for root_kind in [(claude_root(), AgentKind::Claude), (codex_root(), AgentKind::Codex)] {
+    for root_kind in [
+        (claude_root(), AgentKind::Claude),
+        (codex_root(), AgentKind::Codex),
+    ] {
         let Some(root) = root_kind.0 else { continue };
         if !root.exists() {
             continue;
