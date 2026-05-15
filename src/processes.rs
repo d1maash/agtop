@@ -1,11 +1,13 @@
 use std::collections::HashSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime};
 use walkdir::WalkDir;
+
+#[cfg(unix)]
+use std::process::Command;
 
 /// Returns the set of session JSONL files whose owning CLI process is alive
 /// right now. Detection logic:
@@ -37,8 +39,10 @@ pub fn running_session_paths() -> Option<HashSet<PathBuf>> {
                     continue;
                 }
                 let Ok(meta) = entry.metadata() else { continue };
-                let Ok(modified) = meta.modified() else { continue };
-                if now.duration_since(modified).map_or(false, |d| d <= window) {
+                let Ok(modified) = meta.modified() else {
+                    continue;
+                };
+                if now.duration_since(modified).is_ok_and(|d| d <= window) {
                     paths.insert(p);
                 }
             }
@@ -62,7 +66,9 @@ pub fn running_session_paths() -> Option<HashSet<PathBuf>> {
                 };
                 let _ = name;
                 let Ok(meta) = entry.metadata() else { continue };
-                let Ok(modified) = meta.modified() else { continue };
+                let Ok(modified) = meta.modified() else {
+                    continue;
+                };
                 if now.duration_since(modified).map_or(true, |d| d > window) {
                     continue;
                 }
@@ -104,6 +110,12 @@ fn codex_session_cwd(path: &Path) -> Option<String> {
 
 /// CWDs of every running `claude`/`codex` CLI process. Excludes desktop
 /// Electron apps and helpers. Dedups.
+///
+/// Unix-only because the implementation shells out to `ps` and `lsof`.
+/// On non-unix targets this returns `None`, which causes
+/// `running_session_paths` to short-circuit and the UI to fall back to its
+/// mtime heuristic for the "running" filter.
+#[cfg(unix)]
 fn running_cli_cwds() -> Option<HashSet<PathBuf>> {
     let out = Command::new("ps")
         .args(["-A", "-o", "pid=,args="])
@@ -134,13 +146,16 @@ fn running_cli_cwds() -> Option<HashSet<PathBuf>> {
     Some(cwds)
 }
 
+#[cfg(not(unix))]
+fn running_cli_cwds() -> Option<HashSet<PathBuf>> {
+    None
+}
+
+#[cfg(unix)]
 fn is_cli_command(cmdline: &str) -> bool {
     let first = cmdline.split_whitespace().next().unwrap_or("");
-    let is_claude = (first.ends_with("/claude")
-        || first.ends_with("/claude.exe")
-        || first == "claude"
-        || first == "claude.exe")
-        && !first.contains("/Claude.app/");
+    let is_claude =
+        (first.ends_with("/claude") || first == "claude") && !first.contains("/Claude.app/");
     let is_codex = (first.ends_with("/codex") || first == "codex")
         && !first.contains("/Codex.app/")
         && !cmdline.contains("Codex Helper")
@@ -148,6 +163,7 @@ fn is_cli_command(cmdline: &str) -> bool {
     is_claude || is_codex
 }
 
+#[cfg(unix)]
 fn cwd_of(pid: u32) -> Option<PathBuf> {
     let out = Command::new("lsof")
         .args(["-p", &pid.to_string(), "-d", "cwd", "-Fn"])
@@ -165,7 +181,7 @@ fn cwd_of(pid: u32) -> Option<PathBuf> {
 /// Claude Code names its project dirs by replacing every '/' AND every '.'
 /// in the cwd with '-' (the leading slash becomes a leading dash too). So
 /// `/Users/foo/my.app` → `-Users-foo-my-app`.
-fn encode_cwd_for_claude(cwd: &Path) -> String {
+pub(crate) fn encode_cwd_for_claude(cwd: &Path) -> String {
     cwd.to_string_lossy().replace(['/', '.'], "-")
 }
 
@@ -196,5 +212,36 @@ impl OpenFilesWatcher {
 
     pub fn snapshot(&self) -> Option<HashSet<PathBuf>> {
         self.inner.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_cwd_replaces_slashes_and_dots() {
+        assert_eq!(
+            encode_cwd_for_claude(Path::new("/Users/foo/my.app")),
+            "-Users-foo-my-app"
+        );
+    }
+
+    #[test]
+    fn encode_cwd_handles_plain_path() {
+        assert_eq!(
+            encode_cwd_for_claude(Path::new("/Users/foo/proj")),
+            "-Users-foo-proj"
+        );
+    }
+
+    #[test]
+    fn encode_cwd_collapses_no_chars() {
+        assert_eq!(encode_cwd_for_claude(Path::new("plain")), "plain");
+    }
+
+    #[test]
+    fn encode_cwd_multi_dot_filename() {
+        assert_eq!(encode_cwd_for_claude(Path::new("/a.b.c/d")), "-a-b-c-d");
     }
 }

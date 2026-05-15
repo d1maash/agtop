@@ -61,4 +61,3 @@ pub fn lookup(model: &str) -> Option<Price> {
         None
     }
 }
-

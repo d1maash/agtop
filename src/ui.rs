@@ -1,4 +1,4 @@
-use crate::model::{AgentKind, Session};
+use crate::model::{AgentKind, SessionView};
 use crate::watcher::{current, Shared};
 use anyhow::Result;
 use chrono::Utc;
@@ -73,11 +73,11 @@ impl App {
     }
 
     /// Returns the published snapshot plus a sorted+filtered list of refs
-    /// into it. No Session bodies are copied here — the Arc bump is the only
-    /// shared-state work, and sorting operates on `&Session`.
-    fn view<'a>(&self, snap: &'a [Session]) -> Vec<&'a Session> {
+    /// into it. No session bodies are copied here — the Arc bump is the only
+    /// shared-state work, and sorting operates on `&SessionView`.
+    fn view<'a>(&self, snap: &'a [SessionView]) -> Vec<&'a SessionView> {
         let open = self.open_files.snapshot();
-        let mut v: Vec<&Session> = snap.iter().collect();
+        let mut v: Vec<&SessionView> = snap.iter().collect();
         if !self.show_inactive {
             match open.as_ref() {
                 Some(open_set) => v.retain(|s| open_set.contains(&s.file)),
@@ -99,18 +99,18 @@ impl App {
     }
 }
 
-fn sort_sessions(sessions: &mut [&Session], by: SortBy) {
+fn sort_sessions(sessions: &mut [&SessionView], by: SortBy) {
     match by {
         SortBy::LastActivity => sessions.sort_by(|a, b| b.last_activity.cmp(&a.last_activity)),
         SortBy::Tokens => sessions.sort_by(|a, b| b.tokens.total().cmp(&a.tokens.total())),
-        SortBy::Project => sessions.sort_by(|a, b| a.project_name().cmp(&b.project_name())),
+        SortBy::Project => sessions.sort_by_key(|a| a.project_name()),
         SortBy::Cost => sessions.sort_by(|a, b| {
-            b.cost_usd()
+            b.cost_usd
                 .unwrap_or(0.0)
-                .partial_cmp(&a.cost_usd().unwrap_or(0.0))
+                .partial_cmp(&a.cost_usd.unwrap_or(0.0))
                 .unwrap_or(std::cmp::Ordering::Equal)
         }),
-        SortBy::Rate => sessions.sort_by(|a, b| b.tokens_per_min().cmp(&a.tokens_per_min())),
+        SortBy::Rate => sessions.sort_by(|a, b| b.tokens_last_60s.cmp(&a.tokens_last_60s)),
         SortBy::Source => sessions.sort_by(|a, b| {
             (a.kind.label(), std::cmp::Reverse(a.last_activity))
                 .cmp(&(b.kind.label(), std::cmp::Reverse(b.last_activity)))
@@ -153,7 +153,7 @@ fn main_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, shared: Shared) 
     Ok(())
 }
 
-fn draw(f: &mut ratatui::Frame, app: &mut App, sessions: &[&Session], hidden: usize) {
+fn draw(f: &mut ratatui::Frame, app: &mut App, sessions: &[&SessionView], hidden: usize) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -168,29 +168,52 @@ fn draw(f: &mut ratatui::Frame, app: &mut App, sessions: &[&Session], hidden: us
     draw_footer(f, chunks[2], app);
 }
 
-fn draw_header(f: &mut ratatui::Frame, area: ratatui::layout::Rect, sessions: &[&Session]) {
+fn draw_header(f: &mut ratatui::Frame, area: ratatui::layout::Rect, sessions: &[&SessionView]) {
     let total_tokens: u64 = sessions.iter().map(|s| s.tokens.total()).sum();
-    let total_cost: f64 = sessions.iter().filter_map(|s| s.cost_usd()).sum();
+    let total_cost: f64 = sessions.iter().filter_map(|s| s.cost_usd).sum();
     let active = sessions.iter().filter(|s| is_active(s)).count();
-    let claude_n = sessions.iter().filter(|s| s.kind == AgentKind::Claude).count();
-    let codex_n = sessions.iter().filter(|s| s.kind == AgentKind::Codex).count();
-    let live_rate: u64 = sessions.iter().map(|s| s.tokens_per_min()).sum();
+    let claude_n = sessions
+        .iter()
+        .filter(|s| s.kind == AgentKind::Claude)
+        .count();
+    let codex_n = sessions
+        .iter()
+        .filter(|s| s.kind == AgentKind::Codex)
+        .count();
+    let live_rate: u64 = sessions.iter().map(|s| s.tokens_last_60s).sum();
 
     let line = Line::from(vec![
-        Span::styled("agtop", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "agtop",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw("   "),
-        Span::raw(format!("sessions: {}  active: {}  ", sessions.len(), active)),
-        Span::styled(format!("claude:{}  ", claude_n), Style::default().fg(Color::Magenta)),
-        Span::styled(format!("codex:{}", codex_n), Style::default().fg(Color::Green)),
+        Span::raw(format!(
+            "sessions: {}  active: {}  ",
+            sessions.len(),
+            active
+        )),
+        Span::styled(
+            format!("claude:{}  ", claude_n),
+            Style::default().fg(Color::Magenta),
+        ),
+        Span::styled(
+            format!("codex:{}", codex_n),
+            Style::default().fg(Color::Green),
+        ),
         Span::raw(format!("   tokens: {}", fmt_num(total_tokens))),
         Span::raw("   "),
         Span::styled(
             format!("${:.2}", total_cost),
-            Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw("   "),
         Span::styled(
-            format!("{} tok/min", fmt_num(live_rate)),
+            format!("{} tok/60s", fmt_num(live_rate)),
             Style::default().fg(Color::Yellow),
         ),
     ]);
@@ -202,15 +225,21 @@ fn draw_table(
     f: &mut ratatui::Frame,
     area: ratatui::layout::Rect,
     app: &mut App,
-    sessions: &[&Session],
+    sessions: &[&SessionView],
     hidden: usize,
 ) {
     let header_cells = [
-        "SRC", "ID", "PROJECT", "MODEL", "IN", "OUT", "CACHE", "TOTAL", "TOK/MIN", "$", "AGO",
+        "SRC", "ID", "PROJECT", "MODEL", "IN", "OUT", "CACHE", "TOTAL", "TOK/60S", "$", "AGO",
         "STATUS",
     ]
     .iter()
-    .map(|h| Cell::from(*h).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+    .map(|h| {
+        Cell::from(*h).style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    });
     let header = Row::new(header_cells).height(1);
 
     let rows: Vec<Row> = sessions
@@ -222,18 +251,23 @@ fn draw_table(
             };
             let active = is_active(s);
             let status_text = if active { "● active" } else { "  idle" };
-            let status_color = if active { Color::Green } else { Color::DarkGray };
+            let status_color = if active {
+                Color::Green
+            } else {
+                Color::DarkGray
+            };
 
-            let rate = s.tokens_per_min();
+            let rate = s.tokens_last_60s;
             let rate_cell = if rate > 0 {
                 Cell::from(fmt_num(rate)).style(Style::default().fg(Color::Yellow))
             } else {
                 Cell::from("·").style(Style::default().fg(Color::DarkGray))
             };
 
-            let cost_cell = match s.cost_usd() {
-                Some(c) if c >= 0.01 => Cell::from(format!("${:.2}", c))
-                    .style(Style::default().fg(Color::LightGreen)),
+            let cost_cell = match s.cost_usd {
+                Some(c) if c >= 0.01 => {
+                    Cell::from(format!("${:.2}", c)).style(Style::default().fg(Color::LightGreen))
+                }
                 Some(_) => Cell::from("<$0.01").style(Style::default().fg(Color::DarkGray)),
                 None => Cell::from("-").style(Style::default().fg(Color::DarkGray)),
             };
@@ -280,7 +314,11 @@ fn draw_table(
             sort_label(app.sort)
         )
     } else {
-        format!(" sessions ({}) — sort: {} ", sessions.len(), sort_label(app.sort))
+        format!(
+            " sessions ({}) — sort: {} ",
+            sessions.len(),
+            sort_label(app.sort)
+        )
     };
 
     let table = Table::new(rows, widths)
@@ -298,15 +336,24 @@ fn draw_table(
 fn draw_footer(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
     let visibility = if app.show_inactive { "all" } else { "running" };
     let line = Line::from(vec![
-        chip("q"), Span::raw(" quit  "),
-        chip("↑↓/jk"), Span::raw(" nav  "),
-        chip("t"), Span::raw(" tokens  "),
-        chip("c"), Span::raw(" cost  "),
-        chip("m"), Span::raw(" rate  "),
-        chip("a"), Span::raw(" activity  "),
-        chip("p"), Span::raw(" project  "),
-        chip("s"), Span::raw(" source  "),
-        chip("A"), Span::raw(format!(" show:{}", visibility)),
+        chip("q"),
+        Span::raw(" quit  "),
+        chip("↑↓/jk"),
+        Span::raw(" nav  "),
+        chip("t"),
+        Span::raw(" tokens  "),
+        chip("c"),
+        Span::raw(" cost  "),
+        chip("m"),
+        Span::raw(" rate  "),
+        chip("a"),
+        Span::raw(" activity  "),
+        chip("p"),
+        Span::raw(" project  "),
+        chip("s"),
+        Span::raw(" source  "),
+        chip("A"),
+        Span::raw(format!(" show:{}", visibility)),
     ]);
     f.render_widget(Paragraph::new(line), area);
 }
@@ -318,7 +365,7 @@ fn chip(label: &str) -> Span<'_> {
     )
 }
 
-fn is_active(s: &Session) -> bool {
+fn is_active(s: &SessionView) -> bool {
     s.last_activity
         .map(|t| (Utc::now() - t).num_seconds() <= ACTIVE_WINDOW_SECS)
         .unwrap_or(false)
@@ -329,23 +376,30 @@ fn is_active(s: &Session) -> bool {
 /// both because file mtime captures activity that hasn't been parsed yet
 /// (e.g. between watcher ticks), while last_activity covers cases where
 /// the OS reports a stale mtime.
-fn is_running(s: &Session) -> bool {
+fn is_running(s: &SessionView) -> bool {
     if is_active(s) {
         return true;
     }
-    let Ok(meta) = std::fs::metadata(&s.file) else { return false; };
-    let Ok(modified) = meta.modified() else { return false; };
+    let Ok(meta) = std::fs::metadata(&s.file) else {
+        return false;
+    };
+    let Ok(modified) = meta.modified() else {
+        return false;
+    };
     modified
         .elapsed()
         .map(|d| d.as_secs() <= ACTIVE_WINDOW_SECS as u64)
         .unwrap_or(false)
 }
 
-fn format_ago(s: &Session) -> String {
+fn format_ago(s: &SessionView) -> String {
     let Some(t) = s.last_activity else {
         return "-".into();
     };
-    let secs = (Utc::now() - t).num_seconds();
+    format_ago_secs((Utc::now() - t).num_seconds())
+}
+
+fn format_ago_secs(secs: i64) -> String {
     if secs < 0 {
         return "now".into();
     }
@@ -382,5 +436,35 @@ fn sort_label(s: SortBy) -> &'static str {
         SortBy::Cost => "cost",
         SortBy::Rate => "rate",
         SortBy::Source => "source",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fmt_num_buckets() {
+        assert_eq!(fmt_num(0), "0");
+        assert_eq!(fmt_num(42), "42");
+        assert_eq!(fmt_num(999), "999");
+        assert_eq!(fmt_num(1_000), "1.0k");
+        assert_eq!(fmt_num(1_500), "1.5k");
+        assert_eq!(fmt_num(999_999), "1000.0k");
+        assert_eq!(fmt_num(1_000_000), "1.0M");
+        assert_eq!(fmt_num(2_500_000), "2.5M");
+    }
+
+    #[test]
+    fn format_ago_buckets() {
+        assert_eq!(format_ago_secs(-5), "now");
+        assert_eq!(format_ago_secs(0), "0s");
+        assert_eq!(format_ago_secs(59), "59s");
+        assert_eq!(format_ago_secs(60), "1m");
+        assert_eq!(format_ago_secs(3_599), "59m");
+        assert_eq!(format_ago_secs(3_600), "1h");
+        assert_eq!(format_ago_secs(47 * 3_600), "47h");
+        assert_eq!(format_ago_secs(48 * 3_600), "2d");
+        assert_eq!(format_ago_secs(10 * 24 * 3_600), "10d");
     }
 }

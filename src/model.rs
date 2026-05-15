@@ -113,8 +113,11 @@ impl Session {
         }
     }
 
-    /// Tokens per minute over the last 60 wall-clock seconds.
-    pub fn tokens_per_min(&self) -> u64 {
+    /// Sum of token deltas observed in the last 60 wall-clock seconds. Note:
+    /// this is a windowed *count*, not a true rate — a single 30k-token burst
+    /// 5s ago reads as 30000 here even though the instantaneous rate is much
+    /// higher. The UI label "tok/60s" matches this definition.
+    pub fn tokens_last_60s(&self) -> u64 {
         let cutoff = Utc::now() - Duration::seconds(RATE_WINDOW_SECS);
         self.samples
             .iter()
@@ -136,5 +139,114 @@ impl Session {
                 + (t.cache_read as f64) * p.cache_read / per
                 + (t.cache_creation as f64) * p.cache_write / per,
         )
+    }
+
+    /// Render-only projection: drops `samples` (the unbounded VecDeque that
+    /// makes `Session::clone` expensive) and pre-resolves the time-derived
+    /// quantities the UI needs. The watcher hands a `Vec<SessionView>` to the
+    /// UI every publish tick (~250 ms), so cloning each session's sample
+    /// buffer would do real allocation work for no visible benefit.
+    pub fn view(&self) -> SessionView {
+        SessionView {
+            kind: self.kind,
+            id: self.id.clone(),
+            file: self.file.clone(),
+            cwd: self.cwd.clone(),
+            model: self.model.clone(),
+            last_activity: self.last_activity,
+            tokens: self.tokens,
+            tokens_last_60s: self.tokens_last_60s(),
+            cost_usd: self.cost_usd(),
+        }
+    }
+}
+
+/// Snapshot of a `Session` for UI rendering. Cheap to clone — no `VecDeque`,
+/// no pricing pointer, no per-event sample history. Times that depend on
+/// "now" (rate window, cost) are frozen at the moment of construction.
+#[derive(Debug, Clone)]
+pub struct SessionView {
+    pub kind: AgentKind,
+    pub id: String,
+    pub file: PathBuf,
+    pub cwd: Option<String>,
+    pub model: Option<String>,
+    pub last_activity: Option<DateTime<Utc>>,
+    pub tokens: TokenStats,
+    pub tokens_last_60s: u64,
+    pub cost_usd: Option<f64>,
+}
+
+impl SessionView {
+    pub fn short_id(&self) -> String {
+        self.id.chars().take(8).collect()
+    }
+
+    pub fn project_name(&self) -> String {
+        self.cwd
+            .as_deref()
+            .and_then(|p| p.rsplit('/').next())
+            .unwrap_or("-")
+            .to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn sess() -> Session {
+        Session::new(AgentKind::Claude, PathBuf::from("/tmp/x.jsonl"))
+    }
+
+    #[test]
+    fn push_sample_ignores_zero() {
+        let mut s = sess();
+        s.push_sample(Utc::now(), 0);
+        assert!(s.samples.is_empty());
+    }
+
+    #[test]
+    fn tokens_last_60s_sums_recent_only() {
+        let mut s = sess();
+        let now = Utc::now();
+        s.push_sample(now - Duration::seconds(120), 1_000); // outside window
+        s.push_sample(now - Duration::seconds(30), 500);
+        s.push_sample(now - Duration::seconds(10), 200);
+        assert_eq!(s.tokens_last_60s(), 700);
+    }
+
+    #[test]
+    fn push_sample_drops_beyond_retain() {
+        let mut s = sess();
+        let now = Utc::now();
+        // Older than RATE_RETAIN_SECS (300s).
+        s.push_sample(now - Duration::seconds(600), 42);
+        s.push_sample(now, 1);
+        // The stale entry should have been evicted on the second push.
+        assert_eq!(s.samples.len(), 1);
+        assert_eq!(s.samples.front().unwrap().1, 1);
+    }
+
+    #[test]
+    fn token_stats_total_sums_all_fields() {
+        let t = TokenStats {
+            input: 1,
+            output: 2,
+            cache_read: 4,
+            cache_creation: 8,
+            reasoning: 16,
+        };
+        assert_eq!(t.total(), 31);
+    }
+
+    #[test]
+    fn project_name_uses_last_path_segment() {
+        let mut s = sess();
+        s.cwd = Some("/Users/foo/my-app".into());
+        assert_eq!(s.project_name(), "my-app");
+        s.cwd = None;
+        assert_eq!(s.project_name(), "-");
     }
 }

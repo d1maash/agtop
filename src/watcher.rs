@@ -1,17 +1,19 @@
-use crate::model::{AgentKind, Session};
+use crate::model::{AgentKind, Session, SessionView};
 use crate::sources;
 use anyhow::Result;
 use notify::event::ModifyKind;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 /// Immutable view of all known sessions. Published by the watcher thread,
 /// consumed by the UI. Cloning is an `Arc` bump — no session data copies.
-pub type Snapshot = Arc<Vec<Session>>;
+/// `SessionView` is the render-only projection of `Session`, so the per-event
+/// sample buffer doesn't get cloned every publish tick.
+pub type Snapshot = Arc<Vec<SessionView>>;
 
 /// Cell holding the latest published snapshot. The mutex is held only long
 /// enough to clone the inner `Arc`, so UI reads never wait on watcher work.
@@ -27,13 +29,13 @@ pub fn current(shared: &Shared) -> Snapshot {
 /// mutating in place.
 pub fn build_initial_state() -> (Shared, HashMap<PathBuf, Session>) {
     let map = sources::initial_scan().unwrap_or_default();
-    let snap: Vec<Session> = map.values().cloned().collect();
+    let snap: Vec<SessionView> = map.values().map(Session::view).collect();
     let shared = Arc::new(Mutex::new(Arc::new(snap)));
     (shared, map)
 }
 
 fn publish(shared: &Shared, map: &HashMap<PathBuf, Session>) {
-    let snap: Vec<Session> = map.values().cloned().collect();
+    let snap: Vec<SessionView> = map.values().map(Session::view).collect();
     let new = Arc::new(snap);
     *shared.lock().unwrap_or_else(|p| p.into_inner()) = new;
 }
@@ -47,11 +49,12 @@ pub fn spawn(shared: Shared, mut map: HashMap<PathBuf, Session>) -> Result<()> {
     let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |res| {
         let _ = tx.send(res);
     })?;
-    for root in [sources::claude_root(), sources::codex_root()] {
-        if let Some(p) = root {
-            if p.exists() {
-                let _ = watcher.watch(&p, RecursiveMode::Recursive);
-            }
+    for p in [sources::claude_root(), sources::codex_root()]
+        .into_iter()
+        .flatten()
+    {
+        if p.exists() {
+            let _ = watcher.watch(&p, RecursiveMode::Recursive);
         }
     }
 
@@ -103,10 +106,10 @@ pub fn spawn(shared: Shared, mut map: HashMap<PathBuf, Session>) -> Result<()> {
                 last_safety = now;
 
                 for (kind, path) in sources::list_files() {
-                    if !map.contains_key(&path) {
-                        let mut sess = Session::new(kind, path.clone());
+                    if let std::collections::hash_map::Entry::Vacant(e) = map.entry(path.clone()) {
+                        let mut sess = Session::new(kind, path);
                         let _ = sources::tail(&mut sess, true);
-                        map.insert(path, sess);
+                        e.insert(sess);
                         dirty = true;
                     }
                 }
@@ -153,10 +156,10 @@ fn collect(ev: &notify::Event, pending: &mut HashMap<PathBuf, Instant>) {
     }
 }
 
-fn tail_path(map: &mut HashMap<PathBuf, Session>, path: &PathBuf) -> bool {
-    let entry = map.entry(path.clone()).or_insert_with(|| {
+fn tail_path(map: &mut HashMap<PathBuf, Session>, path: &Path) -> bool {
+    let entry = map.entry(path.to_path_buf()).or_insert_with(|| {
         let kind = sources::classify(path).unwrap_or(AgentKind::Claude);
-        Session::new(kind, path.clone())
+        Session::new(kind, path.to_path_buf())
     });
     sources::tail(entry, true).unwrap_or(false)
 }

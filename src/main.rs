@@ -9,7 +9,11 @@ use anyhow::Result;
 use clap::Parser;
 
 #[derive(Parser)]
-#[command(name = "agtop", version, about = "htop-like TUI for local AI agent sessions")]
+#[command(
+    name = "agtop",
+    version,
+    about = "htop-like TUI for local AI agent sessions"
+)]
 struct Cli {
     /// Print sessions as a table and exit (no TUI)
     #[arg(long)]
