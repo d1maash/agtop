@@ -1,4 +1,5 @@
 use crate::model::{AgentKind, SessionView};
+use crate::processes::RunningSnapshot;
 use crate::watcher::{current, Shared};
 use anyhow::Result;
 use chrono::Utc;
@@ -76,12 +77,17 @@ impl App {
     /// into it. No session bodies are copied here — the Arc bump is the only
     /// shared-state work, and sorting operates on `&SessionView`.
     fn view<'a>(&self, snap: &'a [SessionView]) -> Vec<&'a SessionView> {
-        let open = self.open_files.snapshot();
         let mut v: Vec<&SessionView> = snap.iter().collect();
         if !self.show_inactive {
-            match open.as_ref() {
-                Some(open_set) => v.retain(|s| open_set.contains(&s.file)),
-                None => v.retain(|s| is_running(s)),
+            // The watcher precomputes the live set off the render thread, so
+            // this never touches the disk. The mtime fallback only knows file
+            // write times, so OR in our parsed last-activity to catch a fresh
+            // write the OS reports as stale.
+            match self.open_files.snapshot() {
+                RunningSnapshot::Tracked(open) => v.retain(|s| open.contains(&s.file)),
+                RunningSnapshot::Mtime(open) => {
+                    v.retain(|s| open.contains(&s.file) || is_active(s))
+                }
             }
         }
         sort_sessions(&mut v, self.sort);
@@ -368,27 +374,6 @@ fn chip(label: &str) -> Span<'_> {
 fn is_active(s: &SessionView) -> bool {
     s.last_activity
         .map(|t| (Utc::now() - t).num_seconds() <= ACTIVE_WINDOW_SECS)
-        .unwrap_or(false)
-}
-
-/// A session is "running" if either its log file was written to in the last
-/// 2 minutes, or its parsed last_activity is within that window. We check
-/// both because file mtime captures activity that hasn't been parsed yet
-/// (e.g. between watcher ticks), while last_activity covers cases where
-/// the OS reports a stale mtime.
-fn is_running(s: &SessionView) -> bool {
-    if is_active(s) {
-        return true;
-    }
-    let Ok(meta) = std::fs::metadata(&s.file) else {
-        return false;
-    };
-    let Ok(modified) = meta.modified() else {
-        return false;
-    };
-    modified
-        .elapsed()
-        .map(|d| d.as_secs() <= ACTIVE_WINDOW_SECS as u64)
         .unwrap_or(false)
 }
 

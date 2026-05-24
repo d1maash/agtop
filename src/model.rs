@@ -24,12 +24,11 @@ pub struct TokenStats {
     pub output: u64,
     pub cache_read: u64,
     pub cache_creation: u64,
-    pub reasoning: u64,
 }
 
 impl TokenStats {
     pub fn total(&self) -> u64 {
-        self.input + self.output + self.cache_read + self.cache_creation + self.reasoning
+        self.input + self.output + self.cache_read + self.cache_creation
     }
 }
 
@@ -130,9 +129,9 @@ impl Session {
         let p = self.price?;
         let t = &self.tokens;
         let per = 1_000_000.0;
-        // `t.reasoning` is informational only — for both Claude and Codex, the
-        // vendor's `output_tokens` already includes reasoning/thinking tokens,
-        // so billing it again here would double-charge.
+        // Reasoning/thinking tokens aren't tracked separately: for both Claude
+        // and Codex the vendor's `output_tokens` already includes them, so
+        // they're billed via `t.output` here and counted once in `total()`.
         Some(
             (t.input as f64) * p.input / per
                 + (t.output as f64) * p.output / per
@@ -236,9 +235,8 @@ mod tests {
             output: 2,
             cache_read: 4,
             cache_creation: 8,
-            reasoning: 16,
         };
-        assert_eq!(t.total(), 31);
+        assert_eq!(t.total(), 15);
     }
 
     #[test]

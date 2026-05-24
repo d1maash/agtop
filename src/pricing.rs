@@ -53,7 +53,7 @@ pub fn lookup(model: &str) -> Option<Price> {
         Some(ANTHROPIC_SONNET)
     } else if m.contains("haiku") {
         Some(ANTHROPIC_HAIKU)
-    } else if m.starts_with("gpt-5") || m == "gpt-5" {
+    } else if m.starts_with("gpt-5") {
         Some(OPENAI_GPT5)
     } else if m.contains("o4-mini") || m.contains("o3-mini") {
         Some(OPENAI_O4_MINI)
