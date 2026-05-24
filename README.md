@@ -44,7 +44,8 @@ cargo install --git https://github.com/d1maash/agtop
 
 ```bash
 agtop            # live TUI (refreshes as session logs grow)
-agtop --once     # one-shot dump to stdout (good for scripts / cron)
+agtop --once     # one-shot table dump to stdout (good for scripts / cron)
+agtop --json     # one-shot JSON dump (scripting, cron reports, Grafana)
 agtop --version
 ```
 
@@ -55,6 +56,7 @@ agtop --version
 | `q` / Esc | Quit                                          |
 | `↑` / `k` | Move selection up                             |
 | `↓` / `j` | Move selection down                           |
+| `Enter`   | Open detail view for the selected session (Esc/Enter to close) |
 | `t`       | Sort by total tokens                          |
 | `c`       | Sort by cost ($)                              |
 | `m`       | Sort by current rate (tokens in last 60s)     |
@@ -75,12 +77,22 @@ agtop --version
 | `OUT`       | Total output tokens                                                           |
 | `CACHE`     | Cache read + cache write tokens                                               |
 | `TOTAL`     | Sum of all token counters                                                     |
+| `CTX`       | Last turn's prompt tokens as a percentage of the model's context window (green < 70%, yellow ≥ 70%, red ≥ 90%); `·` when the window size is unknown |
 | `TOK/60S`   | Sum of token deltas in the last 60 wall-clock seconds (windowed count, not an instantaneous rate — a single 30k-token burst within the window reads as `30.0k`) |
 | `$`         | Estimated cost in USD using the model's public list price                     |
 | `AGO`       | Time since last activity                                                      |
 | `STATUS`    | `● active` if last activity is within 2 minutes, otherwise `idle`             |
 
 The header row also shows aggregate totals across all visible sessions: token count, total $, and the global last-60s token sum.
+
+## Detail view
+
+Press `Enter` on a row to open a modal for that session. It shows a sparkline
+of token activity over the last ~5 minutes (bucketed from the same per-event
+samples that feed `TOK/60S`), the full in / out / cache-read / cache-write
+breakdown, turn count, cost, the context-window gauge (`used / max (pct)`,
+color-coded), model, file path, and start/last-activity times. `Esc` or `Enter`
+closes it.
 
 ## How it works
 
@@ -123,10 +135,13 @@ To override prices for your situation, edit `src/pricing.rs` and rebuild — the
 
 ## Roadmap
 
-- [ ] Detail view (Enter on a row): recent tool calls, model swaps, file edits
+- [x] Detail view (Enter on a row): token sparkline, in/out/cache breakdown, context-window gauge, model, path, cost
+- [x] Context-window fill gauge (`CTX` column + detail view)
+- [x] `--json` exporter for scripting / Grafana
+- [ ] `--prom` (Prometheus) exporter
+- [ ] Detail view extras: recent tool calls, model swaps, file edits
 - [ ] Search / filter (`/` like vim)
 - [ ] More agents: Cursor, Aider, Gemini CLI, Goose
-- [ ] `--json` / `--prom` exporters for Grafana
 - [ ] macOS menubar widget showing live `tok/min`
 - [ ] Daily / weekly report mode (`agtop report --since=7d`)
 

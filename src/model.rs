@@ -308,4 +308,32 @@ mod tests {
         s.cwd = None;
         assert_eq!(s.project_name(), "-");
     }
+
+    #[test]
+    fn context_pct_uses_last_turn_against_window() {
+        let mut s = sess();
+        // No model → no window → no pct.
+        s.last_context_tokens = 50_000;
+        assert!(s.context_pct().is_none());
+        // Claude model resolves a 200k window via set_model.
+        s.set_model("claude-opus-4-7".into());
+        assert_eq!(s.context_window, Some(200_000));
+        assert!((s.context_pct().unwrap() - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn spark_buckets_recent_samples_newest_last() {
+        let mut s = sess();
+        let now = Utc::now();
+        // Newest sample lands in the final bucket; a sample at the window edge
+        // lands at the front; anything older is dropped.
+        s.push_sample(now, 100);
+        s.push_sample(now - Duration::seconds(RATE_RETAIN_SECS - 1), 7);
+        s.push_sample(now - Duration::seconds(RATE_RETAIN_SECS + 60), 999);
+        let spark = s.spark();
+        assert_eq!(spark.len(), SPARK_BUCKETS);
+        assert_eq!(*spark.last().unwrap(), 100);
+        assert_eq!(spark[0], 7);
+        assert_eq!(spark.iter().sum::<u64>(), 107); // stale 999 excluded
+    }
 }

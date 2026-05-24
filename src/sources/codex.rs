@@ -139,6 +139,8 @@ mod tests {
         assert_eq!(s.tokens.input, 700);
         assert_eq!(s.tokens.cache_read, 300);
         assert_eq!(s.tokens.output, 200);
+        // Context = gross input_tokens (already includes the cached portion).
+        assert_eq!(s.last_context_tokens, 1000);
         assert_eq!(s.turn_count, 1);
         // Sample uses the full gross input + output (1000 + 200), matching
         // what the model actually consumed/produced in that turn.

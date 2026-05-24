@@ -118,6 +118,8 @@ mod tests {
         assert_eq!(s.tokens.output, 50);
         assert_eq!(s.tokens.cache_read, 10);
         assert_eq!(s.tokens.cache_creation, 5);
+        // Context = this turn's full prompt: input + cache_read + cache_creation.
+        assert_eq!(s.last_context_tokens, 115);
         assert_eq!(s.turn_count, 1);
         assert!(s.price.is_some()); // resolved via set_model
                                     // live=false → no sample push.
