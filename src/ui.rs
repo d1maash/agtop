@@ -1,4 +1,5 @@
 use crate::model::{AgentKind, SessionView};
+use crate::processes::RunningSnapshot;
 use crate::watcher::{current, Shared};
 use anyhow::Result;
 use chrono::Utc;
@@ -8,10 +9,10 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Sparkline, Table, TableState};
 use ratatui::Terminal;
 use std::io::{self, Stdout};
 use std::time::Duration;
@@ -57,6 +58,9 @@ struct App {
     show_inactive: bool,
     shared: Shared,
     open_files: crate::processes::OpenFilesWatcher,
+    /// When `Some`, the detail overlay is open for the session with this id.
+    /// Tracked by id (not row index) so the view survives re-sorts/filters.
+    detail_id: Option<String>,
 }
 
 impl App {
@@ -69,6 +73,7 @@ impl App {
             show_inactive: false,
             shared,
             open_files: crate::processes::OpenFilesWatcher::spawn(),
+            detail_id: None,
         }
     }
 
@@ -76,12 +81,17 @@ impl App {
     /// into it. No session bodies are copied here — the Arc bump is the only
     /// shared-state work, and sorting operates on `&SessionView`.
     fn view<'a>(&self, snap: &'a [SessionView]) -> Vec<&'a SessionView> {
-        let open = self.open_files.snapshot();
         let mut v: Vec<&SessionView> = snap.iter().collect();
         if !self.show_inactive {
-            match open.as_ref() {
-                Some(open_set) => v.retain(|s| open_set.contains(&s.file)),
-                None => v.retain(|s| is_running(s)),
+            // The watcher precomputes the live set off the render thread, so
+            // this never touches the disk. The mtime fallback only knows file
+            // write times, so OR in our parsed last-activity to catch a fresh
+            // write the OS reports as stale.
+            match self.open_files.snapshot() {
+                RunningSnapshot::Tracked(open) => v.retain(|s| open.contains(&s.file)),
+                RunningSnapshot::Mtime(open) => {
+                    v.retain(|s| open.contains(&s.file) || is_active(s))
+                }
             }
         }
         sort_sessions(&mut v, self.sort);
@@ -126,16 +136,35 @@ fn main_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, shared: Shared) 
         let total = snap.len();
         let sessions = app.view(&snap);
         let hidden = total.saturating_sub(sessions.len());
-        terminal.draw(|f| draw(f, &mut app, &sessions, hidden))?;
+        // Resolve the detail target against the full snapshot so it stays open
+        // even if the session drops out of the filtered/sorted list.
+        let detail = app
+            .detail_id
+            .as_deref()
+            .and_then(|id| snap.iter().find(|s| s.id == id));
+        terminal.draw(|f| draw(f, &mut app, &sessions, hidden, detail))?;
 
         if event::poll(TICK)? {
             if let Event::Key(k) = event::read()? {
                 if k.kind != KeyEventKind::Press {
                     continue;
                 }
+                // Detail overlay open: it owns the keyboard. Esc/Enter/q close
+                // it; everything else is ignored so the list stays put.
+                if app.detail_id.is_some() {
+                    if matches!(k.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
+                        app.detail_id = None;
+                    }
+                    continue;
+                }
                 let len = sessions.len();
                 match k.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Enter => {
+                        if let Some(s) = app.state.selected().and_then(|i| sessions.get(i)) {
+                            app.detail_id = Some(s.id.clone());
+                        }
+                    }
                     KeyCode::Down | KeyCode::Char('j') => app.move_cursor(1, len),
                     KeyCode::Up | KeyCode::Char('k') => app.move_cursor(-1, len),
                     KeyCode::Char('t') => app.sort = SortBy::Tokens,
@@ -153,7 +182,13 @@ fn main_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, shared: Shared) 
     Ok(())
 }
 
-fn draw(f: &mut ratatui::Frame, app: &mut App, sessions: &[&SessionView], hidden: usize) {
+fn draw(
+    f: &mut ratatui::Frame,
+    app: &mut App,
+    sessions: &[&SessionView],
+    hidden: usize,
+    detail: Option<&SessionView>,
+) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -166,6 +201,10 @@ fn draw(f: &mut ratatui::Frame, app: &mut App, sessions: &[&SessionView], hidden
     draw_header(f, chunks[0], sessions);
     draw_table(f, chunks[1], app, sessions, hidden);
     draw_footer(f, chunks[2], app);
+
+    if let Some(s) = detail {
+        draw_detail(f, s);
+    }
 }
 
 fn draw_header(f: &mut ratatui::Frame, area: ratatui::layout::Rect, sessions: &[&SessionView]) {
@@ -229,8 +268,8 @@ fn draw_table(
     hidden: usize,
 ) {
     let header_cells = [
-        "SRC", "ID", "PROJECT", "MODEL", "IN", "OUT", "CACHE", "TOTAL", "TOK/60S", "$", "AGO",
-        "STATUS",
+        "SRC", "ID", "PROJECT", "MODEL", "IN", "OUT", "CACHE", "TOTAL", "CTX", "TOK/60S", "$",
+        "AGO", "STATUS",
     ]
     .iter()
     .map(|h| {
@@ -272,6 +311,12 @@ fn draw_table(
                 None => Cell::from("-").style(Style::default().fg(Color::DarkGray)),
             };
 
+            let ctx_cell = match s.context_pct {
+                Some(p) => Cell::from(format!("{}%", (p * 100.0).round() as u64))
+                    .style(Style::default().fg(context_color(p))),
+                None => Cell::from("·").style(Style::default().fg(Color::DarkGray)),
+            };
+
             Row::new(vec![
                 Cell::from(s.kind.label()).style(Style::default().fg(src_color)),
                 Cell::from(s.short_id()),
@@ -282,6 +327,7 @@ fn draw_table(
                 Cell::from(fmt_num(s.tokens.cache_read + s.tokens.cache_creation)),
                 Cell::from(fmt_num(s.tokens.total()))
                     .style(Style::default().add_modifier(Modifier::BOLD)),
+                ctx_cell,
                 rate_cell,
                 cost_cell,
                 Cell::from(format_ago(s)),
@@ -299,6 +345,7 @@ fn draw_table(
         Constraint::Length(9),
         Constraint::Length(9),
         Constraint::Length(10),
+        Constraint::Length(5),
         Constraint::Length(9),
         Constraint::Length(8),
         Constraint::Length(7),
@@ -340,6 +387,8 @@ fn draw_footer(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
         Span::raw(" quit  "),
         chip("↑↓/jk"),
         Span::raw(" nav  "),
+        chip("⏎"),
+        Span::raw(" detail  "),
         chip("t"),
         Span::raw(" tokens  "),
         chip("c"),
@@ -365,30 +414,168 @@ fn chip(label: &str) -> Span<'_> {
     )
 }
 
+/// Green well below the limit, yellow approaching it, red near auto-compaction.
+fn context_color(pct: f64) -> Color {
+    if pct >= 0.9 {
+        Color::Red
+    } else if pct >= 0.7 {
+        Color::Yellow
+    } else {
+        Color::Green
+    }
+}
+
+/// A centered rect `pct_x`/`pct_y` percent of `area`, for modal overlays.
+fn centered_rect(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
+    let vert = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - pct_y) / 2),
+            Constraint::Percentage(pct_y),
+            Constraint::Percentage((100 - pct_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - pct_x) / 2),
+            Constraint::Percentage(pct_x),
+            Constraint::Percentage((100 - pct_x) / 2),
+        ])
+        .split(vert[1])[1]
+}
+
+/// Modal detail overlay for one session: identity, token breakdown, cost,
+/// context-window gauge, and a sparkline of token activity over the retained
+/// window. Drawn on top of the table (which it dims via `Clear`).
+fn draw_detail(f: &mut ratatui::Frame, s: &SessionView) {
+    let area = centered_rect(72, 70, f.area());
+    f.render_widget(Clear, area);
+
+    let title = format!(" {} · {} ", s.kind.label(), s.short_id());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // Body rows (info) on top, sparkline pinned to the bottom.
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(4)])
+        .split(inner);
+
+    let label = |t: &str| Span::styled(format!("{t:<9}"), Style::default().fg(Color::DarkGray));
+    let dash = "-".to_string();
+
+    let cost = s
+        .cost_usd
+        .map(|c| format!("${c:.4}"))
+        .unwrap_or_else(|| dash.clone());
+
+    let ctx_line = match (s.context_max, s.context_pct) {
+        (Some(max), Some(p)) => Line::from(vec![
+            label("context"),
+            Span::styled(
+                format!(
+                    "{} / {}  ({}%)",
+                    fmt_num(s.context_used),
+                    fmt_num(max),
+                    (p * 100.0).round() as u64
+                ),
+                Style::default()
+                    .fg(context_color(p))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        _ => Line::from(vec![
+            label("context"),
+            Span::styled(
+                format!("{} / ?", fmt_num(s.context_used)),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+    };
+
+    let info = vec![
+        Line::from(vec![
+            label("model"),
+            Span::raw(s.model.clone().unwrap_or_else(|| dash.clone())),
+        ]),
+        Line::from(vec![label("project"), Span::raw(s.project_name())]),
+        Line::from(vec![
+            label("path"),
+            Span::styled(
+                s.file.display().to_string(),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+        Line::from(""),
+        ctx_line,
+        Line::from(""),
+        Line::from(vec![label("input"), Span::raw(fmt_num(s.tokens.input))]),
+        Line::from(vec![label("output"), Span::raw(fmt_num(s.tokens.output))]),
+        Line::from(vec![
+            label("cache r"),
+            Span::raw(fmt_num(s.tokens.cache_read)),
+        ]),
+        Line::from(vec![
+            label("cache w"),
+            Span::raw(fmt_num(s.tokens.cache_creation)),
+        ]),
+        Line::from(vec![
+            label("total"),
+            Span::styled(
+                fmt_num(s.tokens.total()),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![label("turns"), Span::raw(s.turn_count.to_string())]),
+        Line::from(vec![label("cost"), Span::raw(cost)]),
+        Line::from(vec![
+            label("tok/60s"),
+            Span::styled(
+                fmt_num(s.tokens_last_60s),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]),
+        Line::from(vec![
+            label("started"),
+            Span::raw(
+                s.started_at
+                    .map(|t| format_ago_secs((Utc::now() - t).num_seconds()))
+                    .unwrap_or_else(|| dash.clone()),
+            ),
+            Span::raw(" ago"),
+        ]),
+        Line::from(vec![
+            label("last"),
+            Span::raw(format_ago(s)),
+            Span::raw(" ago"),
+        ]),
+    ];
+    f.render_widget(Paragraph::new(info), rows[0]);
+
+    let peak = s.spark.iter().copied().max().unwrap_or(0);
+    let spark = Sparkline::default()
+        .block(Block::default().borders(Borders::TOP).title(Span::styled(
+            format!(" tokens · last 5m (peak {}) ", fmt_num(peak)),
+            Style::default().fg(Color::DarkGray),
+        )))
+        .data(&s.spark)
+        .style(Style::default().fg(Color::Cyan));
+    f.render_widget(spark, rows[1]);
+}
+
 fn is_active(s: &SessionView) -> bool {
     s.last_activity
         .map(|t| (Utc::now() - t).num_seconds() <= ACTIVE_WINDOW_SECS)
-        .unwrap_or(false)
-}
-
-/// A session is "running" if either its log file was written to in the last
-/// 2 minutes, or its parsed last_activity is within that window. We check
-/// both because file mtime captures activity that hasn't been parsed yet
-/// (e.g. between watcher ticks), while last_activity covers cases where
-/// the OS reports a stale mtime.
-fn is_running(s: &SessionView) -> bool {
-    if is_active(s) {
-        return true;
-    }
-    let Ok(meta) = std::fs::metadata(&s.file) else {
-        return false;
-    };
-    let Ok(modified) = meta.modified() else {
-        return false;
-    };
-    modified
-        .elapsed()
-        .map(|d| d.as_secs() <= ACTIVE_WINDOW_SECS as u64)
         .unwrap_or(false)
 }
 

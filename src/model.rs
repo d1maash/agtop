@@ -24,17 +24,20 @@ pub struct TokenStats {
     pub output: u64,
     pub cache_read: u64,
     pub cache_creation: u64,
-    pub reasoning: u64,
 }
 
 impl TokenStats {
     pub fn total(&self) -> u64 {
-        self.input + self.output + self.cache_read + self.cache_creation + self.reasoning
+        self.input + self.output + self.cache_read + self.cache_creation
     }
 }
 
 const RATE_WINDOW_SECS: i64 = 60;
 const RATE_RETAIN_SECS: i64 = 300; // bound memory
+
+/// Number of time-buckets in the detail-view sparkline. Each bucket covers
+/// `RATE_RETAIN_SECS / SPARK_BUCKETS` seconds of the retained sample window.
+pub const SPARK_BUCKETS: usize = 60;
 
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -46,9 +49,15 @@ pub struct Session {
     /// Cached pricing for `model`. Resolved once when `model` is set so the
     /// per-render cost path skips the substring matching in `pricing::lookup`.
     pub price: Option<Price>,
+    /// Cached context-window size for `model`, resolved alongside `price`.
+    pub context_window: Option<u64>,
     pub started_at: Option<DateTime<Utc>>,
     pub last_activity: Option<DateTime<Utc>>,
     pub tokens: TokenStats,
+    /// Prompt tokens (input + cache) sent on the most recent turn — i.e. the
+    /// current context-window occupancy, as opposed to the lifetime sums in
+    /// `tokens`. Parsers overwrite this each turn rather than accumulating.
+    pub last_context_tokens: u64,
     pub turn_count: u64,
     pub file_offset: u64,
     /// (event_time, tokens_added_in_event). Capped to RATE_RETAIN_SECS.
@@ -69,20 +78,23 @@ impl Session {
             cwd: None,
             model: None,
             price: None,
+            context_window: None,
             started_at: None,
             last_activity: None,
             tokens: TokenStats::default(),
+            last_context_tokens: 0,
             turn_count: 0,
             file_offset: 0,
             samples: VecDeque::new(),
         }
     }
 
-    /// Set the model name and resolve its price once. Source parsers call
-    /// this instead of writing `model` directly so the cached `price` field
-    /// stays in sync.
+    /// Set the model name and resolve its price and context window once. Source
+    /// parsers call this instead of writing `model` directly so the cached
+    /// fields stay in sync.
     pub fn set_model(&mut self, model: String) {
         self.price = crate::pricing::lookup(&model);
+        self.context_window = crate::pricing::context_window(&model);
         self.model = Some(model);
     }
 
@@ -130,9 +142,9 @@ impl Session {
         let p = self.price?;
         let t = &self.tokens;
         let per = 1_000_000.0;
-        // `t.reasoning` is informational only — for both Claude and Codex, the
-        // vendor's `output_tokens` already includes reasoning/thinking tokens,
-        // so billing it again here would double-charge.
+        // Reasoning/thinking tokens aren't tracked separately: for both Claude
+        // and Codex the vendor's `output_tokens` already includes them, so
+        // they're billed via `t.output` here and counted once in `total()`.
         Some(
             (t.input as f64) * p.input / per
                 + (t.output as f64) * p.output / per
@@ -141,11 +153,43 @@ impl Session {
         )
     }
 
+    /// Fraction of the model's context window occupied by the last turn's
+    /// prompt, in `0.0..` (can exceed 1.0 right before auto-compaction).
+    /// `None` when the model's window is unknown.
+    pub fn context_pct(&self) -> Option<f64> {
+        let max = self.context_window?;
+        if max == 0 {
+            return None;
+        }
+        Some(self.last_context_tokens as f64 / max as f64)
+    }
+
+    /// Bucket the retained samples into `SPARK_BUCKETS` equal time slices over
+    /// the last `RATE_RETAIN_SECS`, oldest → newest, summing tokens per slice.
+    /// Feeds `ratatui::widgets::Sparkline` in the detail view.
+    pub fn spark(&self) -> Vec<u64> {
+        let mut buckets = vec![0u64; SPARK_BUCKETS];
+        let now = Utc::now();
+        let span = RATE_RETAIN_SECS as f64;
+        for (t, n) in &self.samples {
+            let age = (now - *t).num_seconds() as f64;
+            if !(0.0..=span).contains(&age) {
+                continue;
+            }
+            // age 0 (newest) → last bucket; age == span (oldest) → first.
+            let frac = 1.0 - age / span;
+            let idx = ((frac * SPARK_BUCKETS as f64) as usize).min(SPARK_BUCKETS - 1);
+            buckets[idx] += n;
+        }
+        buckets
+    }
+
     /// Render-only projection: drops `samples` (the unbounded VecDeque that
     /// makes `Session::clone` expensive) and pre-resolves the time-derived
     /// quantities the UI needs. The watcher hands a `Vec<SessionView>` to the
     /// UI every publish tick (~250 ms), so cloning each session's sample
-    /// buffer would do real allocation work for no visible benefit.
+    /// buffer would do real allocation work for no visible benefit. The
+    /// bucketed `spark` (a fixed `SPARK_BUCKETS`-long Vec) is cheap and bounded.
     pub fn view(&self) -> SessionView {
         SessionView {
             kind: self.kind,
@@ -153,10 +197,16 @@ impl Session {
             file: self.file.clone(),
             cwd: self.cwd.clone(),
             model: self.model.clone(),
+            started_at: self.started_at,
             last_activity: self.last_activity,
             tokens: self.tokens,
             tokens_last_60s: self.tokens_last_60s(),
             cost_usd: self.cost_usd(),
+            context_used: self.last_context_tokens,
+            context_max: self.context_window,
+            context_pct: self.context_pct(),
+            turn_count: self.turn_count,
+            spark: self.spark(),
         }
     }
 }
@@ -171,10 +221,20 @@ pub struct SessionView {
     pub file: PathBuf,
     pub cwd: Option<String>,
     pub model: Option<String>,
+    pub started_at: Option<DateTime<Utc>>,
     pub last_activity: Option<DateTime<Utc>>,
     pub tokens: TokenStats,
     pub tokens_last_60s: u64,
     pub cost_usd: Option<f64>,
+    /// Last turn's prompt tokens (current context occupancy).
+    pub context_used: u64,
+    /// Model context-window size, if known.
+    pub context_max: Option<u64>,
+    /// `context_used / context_max`, if known.
+    pub context_pct: Option<f64>,
+    pub turn_count: u64,
+    /// Bucketed token activity over the retained window for the sparkline.
+    pub spark: Vec<u64>,
 }
 
 impl SessionView {
@@ -236,9 +296,8 @@ mod tests {
             output: 2,
             cache_read: 4,
             cache_creation: 8,
-            reasoning: 16,
         };
-        assert_eq!(t.total(), 31);
+        assert_eq!(t.total(), 15);
     }
 
     #[test]
@@ -248,5 +307,33 @@ mod tests {
         assert_eq!(s.project_name(), "my-app");
         s.cwd = None;
         assert_eq!(s.project_name(), "-");
+    }
+
+    #[test]
+    fn context_pct_uses_last_turn_against_window() {
+        let mut s = sess();
+        // No model → no window → no pct.
+        s.last_context_tokens = 50_000;
+        assert!(s.context_pct().is_none());
+        // Claude model resolves a 200k window via set_model.
+        s.set_model("claude-opus-4-7".into());
+        assert_eq!(s.context_window, Some(200_000));
+        assert!((s.context_pct().unwrap() - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn spark_buckets_recent_samples_newest_last() {
+        let mut s = sess();
+        let now = Utc::now();
+        // Newest sample lands in the final bucket; a sample at the window edge
+        // lands at the front; anything older is dropped.
+        s.push_sample(now, 100);
+        s.push_sample(now - Duration::seconds(RATE_RETAIN_SECS - 1), 7);
+        s.push_sample(now - Duration::seconds(RATE_RETAIN_SECS + 60), 999);
+        let spark = s.spark();
+        assert_eq!(spark.len(), SPARK_BUCKETS);
+        assert_eq!(*spark.last().unwrap(), 100);
+        assert_eq!(spark[0], 7);
+        assert_eq!(spark.iter().sum::<u64>(), 107); // stale 999 excluded
     }
 }

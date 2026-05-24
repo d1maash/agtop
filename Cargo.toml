@@ -1,6 +1,6 @@
 [package]
 name = "agtop"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 description = "htop-like TUI for local AI coding agent sessions (Claude Code, Codex)"
 license = "MIT"

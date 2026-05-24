@@ -185,32 +185,69 @@ pub(crate) fn encode_cwd_for_claude(cwd: &Path) -> String {
     cwd.to_string_lossy().replace(['/', '.'], "-")
 }
 
-/// Shared snapshot of "which jsonl files are owned by a running CLI right now."
-/// Refreshed on a dedicated thread because `running_session_paths()` shells
-/// out to `ps` and `lsof` and walks the codex sessions tree — doing that in
-/// the UI thread caused visible freezes every refresh tick.
-///
-/// `None` means detection isn't available (no `ps`/`lsof`); the UI falls back
-/// to its mtime heuristic. The inner `HashSet` is cheap to clone (paths only)
-/// and we hand out clones so the UI never holds the lock across rendering.
+/// Active-window for the mtime fallback, mirroring the UI's notion of an
+/// "active" session so both detection paths agree on what counts as running.
+const MTIME_ACTIVE_WINDOW: Duration = Duration::from_secs(120);
+
+/// Fallback for platforms without `ps`/`lsof` (e.g. Windows): the set of
+/// session log files whose mtime is within the active window. Runs on the
+/// watcher thread so the render loop never stats files.
+fn running_by_mtime() -> HashSet<PathBuf> {
+    let now = SystemTime::now();
+    crate::sources::list_files()
+        .into_iter()
+        .filter_map(|(_, path)| {
+            let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+            now.duration_since(modified)
+                .is_ok_and(|d| d <= MTIME_ACTIVE_WINDOW)
+                .then_some(path)
+        })
+        .collect()
+}
+
+/// What the background watcher knows about which sessions are live.
+#[derive(Clone)]
+pub enum RunningSnapshot {
+    /// `ps`/`lsof` enumerated the session files held open by a live CLI. This
+    /// is authoritative — a file not in the set means its CLI isn't running.
+    Tracked(HashSet<PathBuf>),
+    /// `ps`/`lsof` unavailable; this is the mtime-fallback set. It only knows
+    /// file write times, so callers should still OR in their own parsed
+    /// last-activity check to catch a fresh write the OS reports stale.
+    Mtime(HashSet<PathBuf>),
+}
+
+fn compute() -> RunningSnapshot {
+    match running_session_paths() {
+        Some(set) => RunningSnapshot::Tracked(set),
+        None => RunningSnapshot::Mtime(running_by_mtime()),
+    }
+}
+
+/// Shared snapshot of "which sessions are live right now." Refreshed on a
+/// dedicated thread because `running_session_paths()` shells out to `ps` and
+/// `lsof` and walks the codex sessions tree — and the mtime fallback stats
+/// every log file. Doing either in the UI thread caused visible freezes every
+/// refresh tick. The inner set is cheap to clone (paths only) and we hand out
+/// clones so the UI never holds the lock across rendering.
 pub struct OpenFilesWatcher {
-    inner: Arc<Mutex<Option<HashSet<PathBuf>>>>,
+    inner: Arc<Mutex<RunningSnapshot>>,
 }
 
 impl OpenFilesWatcher {
     pub fn spawn() -> Self {
-        let inner = Arc::new(Mutex::new(running_session_paths()));
+        let inner = Arc::new(Mutex::new(compute()));
         let bg = Arc::clone(&inner);
         thread::spawn(move || loop {
             thread::sleep(Duration::from_secs(2));
-            let next = running_session_paths();
+            let next = compute();
             let mut guard = bg.lock().unwrap_or_else(|p| p.into_inner());
             *guard = next;
         });
         Self { inner }
     }
 
-    pub fn snapshot(&self) -> Option<HashSet<PathBuf>> {
+    pub fn snapshot(&self) -> RunningSnapshot {
         self.inner.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 }

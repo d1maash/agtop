@@ -83,6 +83,10 @@ pub fn update_from_line(session: &mut Session, line: &str, live: bool) {
                 session.tokens.output += u.output_tokens;
                 session.tokens.cache_read += u.cache_read_input_tokens;
                 session.tokens.cache_creation += u.cache_creation_input_tokens;
+                // Current context occupancy = this turn's full prompt (fresh
+                // input + cached + cache-creation). Overwrite, don't accumulate.
+                session.last_context_tokens =
+                    u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens;
                 session.turn_count += 1;
                 if live {
                     session.push_sample(ts.unwrap_or_else(Utc::now), added);
@@ -114,6 +118,8 @@ mod tests {
         assert_eq!(s.tokens.output, 50);
         assert_eq!(s.tokens.cache_read, 10);
         assert_eq!(s.tokens.cache_creation, 5);
+        // Context = this turn's full prompt: input + cache_read + cache_creation.
+        assert_eq!(s.last_context_tokens, 115);
         assert_eq!(s.turn_count, 1);
         assert!(s.price.is_some()); // resolved via set_model
                                     // live=false → no sample push.
