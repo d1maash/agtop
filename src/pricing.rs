@@ -61,3 +61,20 @@ pub fn lookup(model: &str) -> Option<Price> {
         None
     }
 }
+
+/// Context-window size (max input tokens) for a model, used to show how close
+/// a session is to auto-compaction. Best-effort public values as of 2026-05;
+/// `None` for unknown models so the UI shows no gauge rather than a wrong one.
+/// Like pricing, these are plain constants — patch them if vendors change.
+pub fn context_window(model: &str) -> Option<u64> {
+    let m = model.to_ascii_lowercase();
+    if m.contains("opus") || m.contains("sonnet") || m.contains("haiku") {
+        Some(200_000)
+    } else if m.starts_with("gpt-5") {
+        Some(400_000)
+    } else if m.contains("o4-mini") || m.contains("o3-mini") {
+        Some(200_000)
+    } else {
+        None
+    }
+}

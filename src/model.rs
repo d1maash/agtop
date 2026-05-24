@@ -35,6 +35,10 @@ impl TokenStats {
 const RATE_WINDOW_SECS: i64 = 60;
 const RATE_RETAIN_SECS: i64 = 300; // bound memory
 
+/// Number of time-buckets in the detail-view sparkline. Each bucket covers
+/// `RATE_RETAIN_SECS / SPARK_BUCKETS` seconds of the retained sample window.
+pub const SPARK_BUCKETS: usize = 60;
+
 #[derive(Debug, Clone)]
 pub struct Session {
     pub kind: AgentKind,
