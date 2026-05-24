@@ -157,7 +157,7 @@ Windows the binary still works; it just falls back to an mtime heuristic
 ("modified in the last 2 minutes = running"), which is good enough in
 practice but can show ghost sessions for ~2 minutes after a CLI exits.
 
-## Pricing accuracy
+## Pricing & context-window accuracy
 
 The cost column uses **public list prices** as of `v0.2.0`. They do *not* account for:
 
@@ -167,7 +167,15 @@ The cost column uses **public list prices** as of `v0.2.0`. They do *not* accoun
 
 Treat `$` as a high-water-mark upper bound. If you're on a flat-rate subscription, you're paying less than what `agtop` reports.
 
-To override prices for your situation, edit `src/pricing.rs` and rebuild — there's one `lookup()` function with model-name patterns.
+The `CTX` percentage uses **best-effort context-window sizes** keyed off the model
+name (e.g. 200k for Claude, 400k for GPT-5). Two caveats: extended-context
+variants that aren't distinguishable by name (such as the 1M-token Opus/Sonnet
+beta) are measured against the standard window, and unknown models show `·`
+instead of a guess.
+
+Both tables live in `src/pricing.rs`: `lookup()` for prices and
+`context_window()` for window sizes, each one `match` over model-name patterns.
+Edit and rebuild to fit your situation.
 
 ## Roadmap
 
@@ -189,7 +197,8 @@ Issues and PRs welcome at https://github.com/d1maash/agtop. To run locally:
 git clone https://github.com/d1maash/agtop
 cd agtop
 cargo run
-cargo run -- --once   # data-layer smoke test
+cargo run -- --once   # data-layer smoke test (table)
+cargo run -- --json   # data-layer smoke test (JSON)
 ```
 
 CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy
