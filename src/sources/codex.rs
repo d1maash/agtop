@@ -78,6 +78,9 @@ pub fn update_from_line(session: &mut Session, line: &str, live: bool) {
                     session.tokens.input += net_input;
                     session.tokens.output += u.output_tokens;
                     session.tokens.cache_read += u.cached_input_tokens;
+                    // `input_tokens` is gross (includes cached), so it already
+                    // equals this turn's full context occupancy. Overwrite.
+                    session.last_context_tokens = u.input_tokens;
                     session.turn_count += 1;
                     if live {
                         session.push_sample(ts.unwrap_or_else(Utc::now), added);
