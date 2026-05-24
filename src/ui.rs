@@ -12,9 +12,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, Borders, Cell, Clear, Paragraph, Row, Sparkline, Table, TableState,
-};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Sparkline, Table, TableState};
 use ratatui::Terminal;
 use std::io::{self, Stdout};
 use std::time::Duration;
@@ -154,10 +152,7 @@ fn main_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, shared: Shared) 
                 // Detail overlay open: it owns the keyboard. Esc/Enter/q close
                 // it; everything else is ignored so the list stays put.
                 if app.detail_id.is_some() {
-                    if matches!(
-                        k.code,
-                        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')
-                    ) {
+                    if matches!(k.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
                         app.detail_id = None;
                     }
                     continue;
@@ -513,10 +508,7 @@ fn draw_detail(f: &mut ratatui::Frame, s: &SessionView) {
             label("model"),
             Span::raw(s.model.clone().unwrap_or_else(|| dash.clone())),
         ]),
-        Line::from(vec![
-            label("project"),
-            Span::raw(s.project_name()),
-        ]),
+        Line::from(vec![label("project"), Span::raw(s.project_name())]),
         Line::from(vec![
             label("path"),
             Span::styled(
@@ -527,14 +519,8 @@ fn draw_detail(f: &mut ratatui::Frame, s: &SessionView) {
         Line::from(""),
         ctx_line,
         Line::from(""),
-        Line::from(vec![
-            label("input"),
-            Span::raw(fmt_num(s.tokens.input)),
-        ]),
-        Line::from(vec![
-            label("output"),
-            Span::raw(fmt_num(s.tokens.output)),
-        ]),
+        Line::from(vec![label("input"), Span::raw(fmt_num(s.tokens.input))]),
+        Line::from(vec![label("output"), Span::raw(fmt_num(s.tokens.output))]),
         Line::from(vec![
             label("cache r"),
             Span::raw(fmt_num(s.tokens.cache_read)),
@@ -550,14 +536,14 @@ fn draw_detail(f: &mut ratatui::Frame, s: &SessionView) {
                 Style::default().add_modifier(Modifier::BOLD),
             ),
         ]),
-        Line::from(vec![
-            label("turns"),
-            Span::raw(s.turn_count.to_string()),
-        ]),
+        Line::from(vec![label("turns"), Span::raw(s.turn_count.to_string())]),
         Line::from(vec![label("cost"), Span::raw(cost)]),
         Line::from(vec![
             label("tok/60s"),
-            Span::styled(fmt_num(s.tokens_last_60s), Style::default().fg(Color::Yellow)),
+            Span::styled(
+                fmt_num(s.tokens_last_60s),
+                Style::default().fg(Color::Yellow),
+            ),
         ]),
         Line::from(vec![
             label("started"),
@@ -578,14 +564,10 @@ fn draw_detail(f: &mut ratatui::Frame, s: &SessionView) {
 
     let peak = s.spark.iter().copied().max().unwrap_or(0);
     let spark = Sparkline::default()
-        .block(
-            Block::default()
-                .borders(Borders::TOP)
-                .title(Span::styled(
-                    format!(" tokens · last 5m (peak {}) ", fmt_num(peak)),
-                    Style::default().fg(Color::DarkGray),
-                )),
-        )
+        .block(Block::default().borders(Borders::TOP).title(Span::styled(
+            format!(" tokens · last 5m (peak {}) ", fmt_num(peak)),
+            Style::default().fg(Color::DarkGray),
+        )))
         .data(&s.spark)
         .style(Style::default().fg(Color::Cyan));
     f.render_widget(spark, rows[1]);
