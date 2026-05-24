@@ -2,20 +2,20 @@
 
 `htop` for your local AI coding agents.
 
-`agtop` watches Claude Code (`~/.claude/projects`) and Codex (`~/.codex/sessions`) session logs and shows a live TUI with token usage, **dollar cost**, **tokens in the last 60 seconds**, project, model, and activity for every session on your machine. No network calls, no API keys, no daemon — just local files.
+`agtop` watches Claude Code (`~/.claude/projects`) and Codex (`~/.codex/sessions`) session logs and shows a live TUI with token usage, **dollar cost**, **tokens in the last 60 seconds**, **context-window fill**, project, model, and activity for every session on your machine. No network calls, no API keys, no daemon — just local files.
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
 │ agtop   sessions: 24  active: 2  claude:21  codex:3   tokens: 412.8M   $9661.56   8.4k tok/60s │
 └────────────────────────────────────────────────────────────────────────────────────────┘
 ┌ sessions (24) — sort: cost ───────────────────────────────────────────────────────────┐
-│ SRC     ID         PROJECT             MODEL              TOTAL    TOK/60S     $   AGO  STATUS │
-│ claude  77fdea4e   joinway-learn-ai    claude-opus-4-7   66.5M       4.1k  $124.32  3m   ● active │
-│ claude  567a1738   PromptLab           claude-opus-4-7   32.3M          ·  $122.81  2h     idle  │
-│ codex   019e1d9b   joinway-learn-ai    gpt-5.5            8.5M          ·    $0.86  1d     idle  │
+│ SRC     ID         PROJECT             MODEL              TOTAL   CTX   TOK/60S     $   AGO  STATUS │
+│ claude  77fdea4e   joinway-learn-ai    claude-opus-4-7   66.5M   71%      4.1k  $124.32  3m   ● active │
+│ claude  567a1738   PromptLab           claude-opus-4-7   32.3M   88%         ·  $122.81  2h     idle  │
+│ codex   019e1d9b   joinway-learn-ai    gpt-5.5            8.5M   12%         ·    $0.86  1d     idle  │
 │ ...                                                                                            │
 └────────────────────────────────────────────────────────────────────────────────────────┘
- q  quit   ↑↓/jk  nav   t  tokens   c  cost   m  rate   a  activity   p  project   s  source   A  show:running
+ q  quit   ↑↓/jk  nav   ⏎  detail   t  tokens   c  cost   m  rate   a  activity   p  project   s  source   A  show:running
 ```
 
 ## Install
@@ -46,8 +46,43 @@ cargo install --git https://github.com/d1maash/agtop
 agtop            # live TUI (refreshes as session logs grow)
 agtop --once     # one-shot table dump to stdout (good for scripts / cron)
 agtop --json     # one-shot JSON dump (scripting, cron reports, Grafana)
+agtop --running  # list JSONL files of currently-running CLI sessions, then exit
 agtop --version
 ```
+
+### JSON output
+
+`--json` prints a pretty-printed array, one object per session, sorted by most
+recent activity. Fields are stable and safe to script against:
+
+```jsonc
+[
+  {
+    "source": "claude",            // "claude" or "codex"
+    "id": "bf1f6afa-…",
+    "project": "atop",
+    "cwd": "/Users/me/code/atop",
+    "file": "/Users/me/.claude/projects/…/bf1f6afa-….jsonl",
+    "model": "claude-opus-4-7",
+    "input": 46416,
+    "output": 129686,
+    "cache_read": 8626924,
+    "cache_creation": 326402,
+    "total": 9129428,
+    "tokens_last_60s": 0,
+    "cost_usd": 29.4831,           // null when the model price is unknown
+    "context_used": 108731,        // last turn's prompt tokens
+    "context_max": 200000,         // model context window, null if unknown
+    "context_pct": 0.5436,         // context_used / context_max, null if unknown
+    "turn_count": 119,
+    "started_at": "2026-05-24T15:50:02.318+00:00",  // RFC 3339, null if unseen
+    "last_activity": "2026-05-24T15:56:58.238+00:00"
+  }
+]
+```
+
+Pipe it anywhere, e.g. `agtop --json | jq '[.[] | select(.context_pct > 0.8)]'`
+to find sessions approaching auto-compaction.
 
 ### Keys
 
@@ -100,8 +135,9 @@ closes it.
 2. **Live tail via `notify`.** A filesystem watcher subscribes to changes under both roots. When a session log grows, `agtop` reads only the new bytes (from the saved offset), parses just the new lines, and updates that session's counters.
 3. **Rate window.** Each new token-bearing event is recorded with its timestamp in a per-session sliding window. `TOK/60S` is the sum of token deltas observed in the last 60 seconds of wall-clock time — a windowed count, not an instantaneous rate.
 4. **Cost.** Tokens are multiplied by the model's public list price (input / output / cache-read / cache-write all priced separately). The full table lives in `src/pricing.rs` — patch it if vendors change rates.
+5. **Context window.** The `CTX` column and detail-view gauge track the *last turn's* prompt size (fresh input + cached + cache-creation), not the lifetime sum, and divide it by the model's context window. This is the number that drives auto-compaction, so it tells you which session is about to hit its limit. Window sizes live next to prices in `src/pricing.rs`.
 
-No telemetry, no API requests, no background daemon. The TUI does the work itself and exits clean when you quit.
+No telemetry, no API requests, no background daemon. The TUI does the work itself and exits clean when you quit. All filesystem stats and `ps`/`lsof` probes run on background threads, so the render loop never blocks on I/O.
 
 ## Supported sources
 
