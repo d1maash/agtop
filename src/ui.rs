@@ -9,10 +9,12 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{
+    Block, Borders, Cell, Clear, Paragraph, Row, Sparkline, Table, TableState,
+};
 use ratatui::Terminal;
 use std::io::{self, Stdout};
 use std::time::Duration;
@@ -58,6 +60,9 @@ struct App {
     show_inactive: bool,
     shared: Shared,
     open_files: crate::processes::OpenFilesWatcher,
+    /// When `Some`, the detail overlay is open for the session with this id.
+    /// Tracked by id (not row index) so the view survives re-sorts/filters.
+    detail_id: Option<String>,
 }
 
 impl App {
@@ -70,6 +75,7 @@ impl App {
             show_inactive: false,
             shared,
             open_files: crate::processes::OpenFilesWatcher::spawn(),
+            detail_id: None,
         }
     }
 
