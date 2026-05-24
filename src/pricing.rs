@@ -78,3 +78,26 @@ pub fn context_window(model: &str) -> Option<u64> {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lookup_matches_known_families() {
+        assert_eq!(lookup("claude-opus-4-7").map(|p| p.output), Some(75.0));
+        assert_eq!(lookup("claude-sonnet-4-6").map(|p| p.output), Some(15.0));
+        assert_eq!(lookup("claude-haiku-4-5").map(|p| p.output), Some(5.0));
+        assert_eq!(lookup("gpt-5.5").map(|p| p.input), Some(1.25));
+        assert_eq!(lookup("o4-mini").map(|p| p.input), Some(1.1));
+        assert!(lookup("some-unknown-model").is_none());
+    }
+
+    #[test]
+    fn context_window_matches_known_families() {
+        assert_eq!(context_window("claude-opus-4-7"), Some(200_000));
+        assert_eq!(context_window("gpt-5.5"), Some(400_000));
+        assert_eq!(context_window("o3-mini"), Some(200_000));
+        assert_eq!(context_window("mystery"), None);
+    }
+}
