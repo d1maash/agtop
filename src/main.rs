@@ -1,12 +1,13 @@
 mod model;
 mod pricing;
 mod processes;
+mod report;
 mod sources;
 mod ui;
 mod watcher;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use model::Session;
 use serde::Serialize;
 
@@ -26,6 +27,22 @@ struct Cli {
     /// Print only the JSONL files of currently-running CLI sessions, then exit.
     #[arg(long)]
     running: bool,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Offline usage report aggregated by day, project, and model.
+    Report {
+        /// Only count sessions active within this window (e.g. 7d, 24h, 30m).
+        /// Omit for all history.
+        #[arg(long)]
+        since: Option<String>,
+        /// Emit JSON instead of the text report.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Flat, serde-friendly projection of a `Session` for `--json`. Kept separate
@@ -82,6 +99,9 @@ impl SessionJson {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(Command::Report { since, json }) = cli.command {
+        return report::run(since, json);
+    }
     if cli.running {
         match processes::running_session_paths() {
             Some(set) if set.is_empty() => {
