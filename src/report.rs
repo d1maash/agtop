@@ -242,7 +242,7 @@ fn group_thousands(n: u64) -> String {
     for (i, b) in bytes.iter().enumerate() {
         // A separator precedes every digit whose distance from the end is a
         // positive multiple of 3.
-        if i != 0 && (len - i) % 3 == 0 {
+        if i != 0 && (len - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(*b as char);
