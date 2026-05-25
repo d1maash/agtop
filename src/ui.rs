@@ -1,6 +1,6 @@
 use crate::model::{AgentKind, SessionView};
 use crate::processes::RunningSnapshot;
-use crate::watcher::{current, Shared};
+use crate::watcher::{current, Shared, Snapshot};
 use anyhow::Result;
 use chrono::Utc;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -14,6 +14,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Sparkline, Table, TableState};
 use ratatui::Terminal;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout};
 use std::time::Duration;
 
@@ -52,8 +54,152 @@ enum SortBy {
     Source,
 }
 
+/// One column of the session table. The set actually rendered is chosen at draw
+/// time by [`visible_columns`] based on terminal width, and both data rows and
+/// group-subtotal rows render against that same list so they stay aligned.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Col {
+    Src,
+    Id,
+    Project,
+    Model,
+    In,
+    Out,
+    Cache,
+    Total,
+    Ctx,
+    Rate,
+    Cost,
+    Ago,
+    Status,
+}
+
+/// Every column, in the left-to-right order they appear when all are shown.
+const CANONICAL: [Col; 13] = [
+    Col::Src,
+    Col::Id,
+    Col::Project,
+    Col::Model,
+    Col::In,
+    Col::Out,
+    Col::Cache,
+    Col::Total,
+    Col::Ctx,
+    Col::Rate,
+    Col::Cost,
+    Col::Ago,
+    Col::Status,
+];
+
+impl Col {
+    fn header(self) -> &'static str {
+        match self {
+            Col::Src => "SRC",
+            Col::Id => "ID",
+            Col::Project => "PROJECT",
+            Col::Model => "MODEL",
+            Col::In => "IN",
+            Col::Out => "OUT",
+            Col::Cache => "CACHE",
+            Col::Total => "TOTAL",
+            Col::Ctx => "CTX",
+            Col::Rate => "TOK/60S",
+            Col::Cost => "$",
+            Col::Ago => "AGO",
+            Col::Status => "STATUS",
+        }
+    }
+
+    fn width(self) -> u16 {
+        match self {
+            Col::Src => 7,
+            Col::Id => 10,
+            Col::Project => 22,
+            Col::Model => 18,
+            Col::In => 9,
+            Col::Out => 9,
+            Col::Cache => 9,
+            Col::Total => 10,
+            Col::Ctx => 5,
+            Col::Rate => 9,
+            Col::Cost => 8,
+            Col::Ago => 7,
+            Col::Status => 8,
+        }
+    }
+
+    fn constraint(self) -> Constraint {
+        match self {
+            // Status soaks up any leftover width so the table fills the frame.
+            Col::Status => Constraint::Min(self.width()),
+            _ => Constraint::Length(self.width()),
+        }
+    }
+}
+
+/// Pick the columns that fit in `avail` cells. A small essential set is always
+/// kept; optional columns are added by descending value until space runs out,
+/// so on a narrow terminal CACHE/IN/OUT drop first and the core identity + cost
+/// columns survive. The returned list keeps canonical left-to-right order.
+fn visible_columns(avail: u16) -> Vec<Col> {
+    let essential = [
+        Col::Src,
+        Col::Project,
+        Col::Total,
+        Col::Cost,
+        Col::Ago,
+        Col::Status,
+    ];
+    // Optional columns, most valuable first → CACHE/IN/OUT are the first to go.
+    let optional = [
+        Col::Ctx,
+        Col::Rate,
+        Col::Model,
+        Col::Id,
+        Col::Out,
+        Col::In,
+        Col::Cache,
+    ];
+
+    let spacing = |n: usize| n.saturating_sub(1) as u16; // 1 cell between columns
+    let mut included: Vec<Col> = essential.to_vec();
+    let mut used: u16 = essential.iter().map(|c| c.width()).sum::<u16>() + spacing(essential.len());
+
+    for c in optional {
+        let extra = c.width() + 1; // the column plus one spacing cell
+        if used + extra <= avail {
+            included.push(c);
+            used += extra;
+        }
+    }
+    CANONICAL
+        .iter()
+        .copied()
+        .filter(|c| included.contains(c))
+        .collect()
+}
+
+/// A subtotal header for a project group in the tree view.
+struct GroupHeader {
+    project: String,
+    count: usize,
+    tokens: u64,
+    cost: f64,
+    collapsed: bool,
+}
+
+/// A single rendered table row: either a session or, in grouped mode, a project
+/// subtotal header. The selection cursor moves over these, so Enter can mean
+/// "open detail" on a session or "collapse/expand" on a header.
+enum DisplayRow<'a> {
+    Group(GroupHeader),
+    Session(&'a SessionView),
+}
+
 struct App {
     sort: SortBy,
+    /// Invert the active sort order. Toggled by pressing the current sort key.
+    sort_reverse: bool,
     state: TableState,
     show_inactive: bool,
     shared: Shared,
@@ -61,6 +207,16 @@ struct App {
     /// When `Some`, the detail overlay is open for the session with this id.
     /// Tracked by id (not row index) so the view survives re-sorts/filters.
     detail_id: Option<String>,
+    /// Full-screen key reference overlay.
+    show_help: bool,
+    /// Freeze the displayed snapshot so fast-moving numbers can be read.
+    paused: bool,
+    /// The snapshot captured at the moment of pausing, shown while paused.
+    frozen: Option<Snapshot>,
+    /// Group sessions by project with subtotal rows (the tree view).
+    group: bool,
+    /// Project names whose group is collapsed (children hidden).
+    collapsed: HashSet<String>,
 }
 
 impl App {
@@ -69,17 +225,38 @@ impl App {
         state.select(Some(0));
         Self {
             sort: SortBy::LastActivity,
+            sort_reverse: false,
             state,
             show_inactive: false,
             shared,
             open_files: crate::processes::OpenFilesWatcher::spawn(),
             detail_id: None,
+            show_help: false,
+            paused: false,
+            frozen: None,
+            group: false,
+            collapsed: HashSet::new(),
         }
     }
 
-    /// Returns the published snapshot plus a sorted+filtered list of refs
-    /// into it. No session bodies are copied here — the Arc bump is the only
-    /// shared-state work, and sorting operates on `&SessionView`.
+    /// Select a sort key, or invert direction if it's already active.
+    fn set_sort(&mut self, by: SortBy) {
+        if self.sort == by {
+            self.sort_reverse = !self.sort_reverse;
+        } else {
+            self.sort = by;
+            self.sort_reverse = false;
+        }
+    }
+
+    fn toggle_collapse(&mut self, project: &str) {
+        if !self.collapsed.remove(project) {
+            self.collapsed.insert(project.to_string());
+        }
+    }
+
+    /// Returns a sorted+filtered list of refs into the snapshot. No session
+    /// bodies are copied — sorting operates on `&SessionView`.
     fn view<'a>(&self, snap: &'a [SessionView]) -> Vec<&'a SessionView> {
         let mut v: Vec<&SessionView> = snap.iter().collect();
         if !self.show_inactive {
@@ -94,7 +271,7 @@ impl App {
                 }
             }
         }
-        sort_sessions(&mut v, self.sort);
+        sort_sessions(&mut v, self.sort, self.sort_reverse);
         v
     }
 
@@ -109,7 +286,52 @@ impl App {
     }
 }
 
-fn sort_sessions(sessions: &mut [&SessionView], by: SortBy) {
+/// Expand a sorted session list into the rows to render. Flat unless `group`,
+/// in which case sessions are bucketed by project (preserving first-seen order)
+/// with a subtotal header before each bucket; collapsed buckets hide children.
+fn build_display<'a>(
+    sessions: &[&'a SessionView],
+    group: bool,
+    collapsed: &HashSet<String>,
+) -> Vec<DisplayRow<'a>> {
+    if !group {
+        return sessions.iter().map(|&s| DisplayRow::Session(s)).collect();
+    }
+
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Vec<&'a SessionView>> = HashMap::new();
+    for s in sessions {
+        let project = s.project_name();
+        match groups.entry(project.clone()) {
+            Entry::Occupied(mut e) => e.get_mut().push(*s),
+            Entry::Vacant(e) => {
+                order.push(project);
+                e.insert(vec![*s]);
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for project in order {
+        let members = &groups[&project];
+        let tokens = members.iter().map(|s| s.tokens.total()).sum();
+        let cost = members.iter().filter_map(|s| s.cost_usd).sum();
+        let is_collapsed = collapsed.contains(&project);
+        out.push(DisplayRow::Group(GroupHeader {
+            project: project.clone(),
+            count: members.len(),
+            tokens,
+            cost,
+            collapsed: is_collapsed,
+        }));
+        if !is_collapsed {
+            out.extend(members.iter().map(|&s| DisplayRow::Session(s)));
+        }
+    }
+    out
+}
+
+fn sort_sessions(sessions: &mut [&SessionView], by: SortBy, reverse: bool) {
     match by {
         SortBy::LastActivity => sessions.sort_by_key(|s| std::cmp::Reverse(s.last_activity)),
         SortBy::Tokens => sessions.sort_by_key(|s| std::cmp::Reverse(s.tokens.total())),
@@ -126,53 +348,92 @@ fn sort_sessions(sessions: &mut [&SessionView], by: SortBy) {
                 .cmp(&(b.kind.label(), std::cmp::Reverse(b.last_activity)))
         }),
     }
+    if reverse {
+        sessions.reverse();
+    }
 }
 
 fn main_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, shared: Shared) -> Result<()> {
     let mut app = App::new(shared);
 
     loop {
-        let snap = current(&app.shared);
+        // While paused, keep showing the frozen snapshot instead of the latest.
+        let snap = if app.paused {
+            app.frozen.clone().unwrap_or_else(|| current(&app.shared))
+        } else {
+            current(&app.shared)
+        };
         let total = snap.len();
         let sessions = app.view(&snap);
         let hidden = total.saturating_sub(sessions.len());
+        let display = build_display(&sessions, app.group, &app.collapsed);
+
+        // Keep the cursor inside the current row set after re-sorts/filters.
+        let len = display.len();
+        if len == 0 {
+            app.state.select(None);
+        } else {
+            let i = app.state.selected().unwrap_or(0).min(len - 1);
+            app.state.select(Some(i));
+        }
+
         // Resolve the detail target against the full snapshot so it stays open
         // even if the session drops out of the filtered/sorted list.
         let detail = app
             .detail_id
             .as_deref()
             .and_then(|id| snap.iter().find(|s| s.id == id));
-        terminal.draw(|f| draw(f, &mut app, &sessions, hidden, detail))?;
+        terminal.draw(|f| draw(f, &mut app, &sessions, &display, hidden, detail))?;
 
         if event::poll(TICK)? {
             if let Event::Key(k) = event::read()? {
                 if k.kind != KeyEventKind::Press {
                     continue;
                 }
-                // Detail overlay open: it owns the keyboard. Esc/Enter/q close
-                // it; everything else is ignored so the list stays put.
+                // Help overlay owns the keyboard: ?/Esc/q/Enter close it.
+                if app.show_help {
+                    if matches!(
+                        k.code,
+                        KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter
+                    ) {
+                        app.show_help = false;
+                    }
+                    continue;
+                }
+                // Detail overlay open: Esc/Enter/q close it; rest is ignored.
                 if app.detail_id.is_some() {
                     if matches!(k.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
                         app.detail_id = None;
                     }
                     continue;
                 }
-                let len = sessions.len();
                 match k.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('?') => app.show_help = true,
+                    KeyCode::Char(' ') => {
+                        app.paused = !app.paused;
+                        app.frozen = if app.paused { Some(snap.clone()) } else { None };
+                    }
                     KeyCode::Enter => {
-                        if let Some(s) = app.state.selected().and_then(|i| sessions.get(i)) {
-                            app.detail_id = Some(s.id.clone());
+                        if let Some(row) = app.state.selected().and_then(|i| display.get(i)) {
+                            match row {
+                                DisplayRow::Session(s) => app.detail_id = Some(s.id.clone()),
+                                DisplayRow::Group(g) => {
+                                    let p = g.project.clone();
+                                    app.toggle_collapse(&p);
+                                }
+                            }
                         }
                     }
                     KeyCode::Down | KeyCode::Char('j') => app.move_cursor(1, len),
                     KeyCode::Up | KeyCode::Char('k') => app.move_cursor(-1, len),
-                    KeyCode::Char('t') => app.sort = SortBy::Tokens,
-                    KeyCode::Char('a') => app.sort = SortBy::LastActivity,
-                    KeyCode::Char('p') => app.sort = SortBy::Project,
-                    KeyCode::Char('c') => app.sort = SortBy::Cost,
-                    KeyCode::Char('m') => app.sort = SortBy::Rate,
-                    KeyCode::Char('s') => app.sort = SortBy::Source,
+                    KeyCode::Char('t') => app.set_sort(SortBy::Tokens),
+                    KeyCode::Char('a') => app.set_sort(SortBy::LastActivity),
+                    KeyCode::Char('p') => app.set_sort(SortBy::Project),
+                    KeyCode::Char('c') => app.set_sort(SortBy::Cost),
+                    KeyCode::Char('m') => app.set_sort(SortBy::Rate),
+                    KeyCode::Char('s') => app.set_sort(SortBy::Source),
+                    KeyCode::Char('g') => app.group = !app.group,
                     KeyCode::Char('A') => app.show_inactive = !app.show_inactive,
                     _ => {}
                 }
@@ -186,6 +447,7 @@ fn draw(
     f: &mut ratatui::Frame,
     app: &mut App,
     sessions: &[&SessionView],
+    display: &[DisplayRow],
     hidden: usize,
     detail: Option<&SessionView>,
 ) {
@@ -199,15 +461,34 @@ fn draw(
         .split(f.area());
 
     draw_header(f, chunks[0], sessions);
-    draw_table(f, chunks[1], app, sessions, hidden);
+    draw_table(f, chunks[1], app, display, sessions.len(), hidden);
     draw_footer(f, chunks[2], app);
 
     if let Some(s) = detail {
         draw_detail(f, s);
     }
+    if app.show_help {
+        draw_help(f);
+    }
 }
 
-fn draw_header(f: &mut ratatui::Frame, area: ratatui::layout::Rect, sessions: &[&SessionView]) {
+/// Append `span` if it fits within `avail` (or `force`), tracking used width.
+fn push_if_fits(
+    spans: &mut Vec<Span<'static>>,
+    used: &mut u16,
+    avail: u16,
+    span: Span<'static>,
+    force: bool,
+) {
+    let w = span.content.chars().count() as u16;
+    if force || *used + w <= avail {
+        *used += w;
+        spans.push(span);
+    }
+}
+
+fn draw_header(f: &mut ratatui::Frame, area: Rect, sessions: &[&SessionView]) {
+    let avail = area.width.saturating_sub(2); // inside the border
     let total_tokens: u64 = sessions.iter().map(|s| s.tokens.total()).sum();
     let total_cost: f64 = sessions.iter().filter_map(|s| s.cost_usd).sum();
     let active = sessions.iter().filter(|s| is_active(s)).count();
@@ -221,150 +502,132 @@ fn draw_header(f: &mut ratatui::Frame, area: ratatui::layout::Rect, sessions: &[
         .count();
     let live_rate: u64 = sessions.iter().map(|s| s.tokens_last_60s).sum();
 
-    let line = Line::from(vec![
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0u16;
+    // `agtop` and the session/active counts always show; the rest is added in
+    // priority order while there's room, so a narrow terminal keeps the title.
+    push_if_fits(
+        &mut spans,
+        &mut used,
+        avail,
         Span::styled(
             "agtop",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw("   "),
+        true,
+    );
+    push_if_fits(
+        &mut spans,
+        &mut used,
+        avail,
         Span::raw(format!(
-            "sessions: {}  active: {}  ",
+            "   sessions: {}  active: {}",
             sessions.len(),
             active
         )),
+        true,
+    );
+    push_if_fits(
+        &mut spans,
+        &mut used,
+        avail,
         Span::styled(
-            format!("claude:{}  ", claude_n),
-            Style::default().fg(Color::Magenta),
-        ),
-        Span::styled(
-            format!("codex:{}", codex_n),
-            Style::default().fg(Color::Green),
-        ),
-        Span::raw(format!("   tokens: {}", fmt_num(total_tokens))),
-        Span::raw("   "),
-        Span::styled(
-            format!("${:.2}", total_cost),
+            format!("   ${:.2}", total_cost),
             Style::default()
                 .fg(Color::LightGreen)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw("   "),
+        false,
+    );
+    push_if_fits(
+        &mut spans,
+        &mut used,
+        avail,
+        Span::raw(format!("   tokens: {}", fmt_num(total_tokens))),
+        false,
+    );
+    push_if_fits(
+        &mut spans,
+        &mut used,
+        avail,
         Span::styled(
-            format!("{} tok/60s", fmt_num(live_rate)),
+            format!("   {} tok/60s", fmt_num(live_rate)),
             Style::default().fg(Color::Yellow),
         ),
-    ]);
-    let p = Paragraph::new(line).block(Block::default().borders(Borders::ALL));
+        false,
+    );
+    // claude/codex breakdown is lowest priority; add the pair together so the
+    // counts never appear half-shown.
+    let cc1 = Span::styled(
+        format!("   claude:{}", claude_n),
+        Style::default().fg(Color::Magenta),
+    );
+    let cc2 = Span::styled(
+        format!("  codex:{}", codex_n),
+        Style::default().fg(Color::Green),
+    );
+    let cc_w = (cc1.content.chars().count() + cc2.content.chars().count()) as u16;
+    if used + cc_w <= avail {
+        spans.push(cc1);
+        spans.push(cc2);
+    }
+
+    let p = Paragraph::new(Line::from(spans)).block(Block::default().borders(Borders::ALL));
     f.render_widget(p, area);
 }
 
 fn draw_table(
     f: &mut ratatui::Frame,
-    area: ratatui::layout::Rect,
+    area: Rect,
     app: &mut App,
-    sessions: &[&SessionView],
+    display: &[DisplayRow],
+    session_count: usize,
     hidden: usize,
 ) {
-    let header_cells = [
-        "SRC", "ID", "PROJECT", "MODEL", "IN", "OUT", "CACHE", "TOTAL", "CTX", "TOK/60S", "$",
-        "AGO", "STATUS",
-    ]
-    .iter()
-    .map(|h| {
-        Cell::from(*h).style(
+    let cols = visible_columns(area.width.saturating_sub(2));
+
+    let header = Row::new(cols.iter().map(|c| {
+        Cell::from(c.header()).style(
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         )
-    });
-    let header = Row::new(header_cells).height(1);
+    }))
+    .height(1);
 
-    let rows: Vec<Row> = sessions
+    let rows: Vec<Row> = display
         .iter()
-        .map(|s| {
-            let src_color = match s.kind {
-                AgentKind::Claude => Color::Magenta,
-                AgentKind::Codex => Color::Green,
-            };
-            let active = is_active(s);
-            let status_text = if active { "● active" } else { "  idle" };
-            let status_color = if active {
-                Color::Green
-            } else {
-                Color::DarkGray
-            };
-
-            let rate = s.tokens_last_60s;
-            let rate_cell = if rate > 0 {
-                Cell::from(fmt_num(rate)).style(Style::default().fg(Color::Yellow))
-            } else {
-                Cell::from("·").style(Style::default().fg(Color::DarkGray))
-            };
-
-            let cost_cell = match s.cost_usd {
-                Some(c) if c >= 0.01 => {
-                    Cell::from(format!("${:.2}", c)).style(Style::default().fg(Color::LightGreen))
-                }
-                Some(_) => Cell::from("<$0.01").style(Style::default().fg(Color::DarkGray)),
-                None => Cell::from("-").style(Style::default().fg(Color::DarkGray)),
-            };
-
-            let ctx_cell = match s.context_pct {
-                Some(p) => Cell::from(format!("{}%", (p * 100.0).round() as u64))
-                    .style(Style::default().fg(context_color(p))),
-                None => Cell::from("·").style(Style::default().fg(Color::DarkGray)),
-            };
-
-            Row::new(vec![
-                Cell::from(s.kind.label()).style(Style::default().fg(src_color)),
-                Cell::from(s.short_id()),
-                Cell::from(s.project_name()),
-                Cell::from(s.model.clone().unwrap_or_else(|| "-".into())),
-                Cell::from(fmt_num(s.tokens.input)),
-                Cell::from(fmt_num(s.tokens.output)),
-                Cell::from(fmt_num(s.tokens.cache_read + s.tokens.cache_creation)),
-                Cell::from(fmt_num(s.tokens.total()))
-                    .style(Style::default().add_modifier(Modifier::BOLD)),
-                ctx_cell,
-                rate_cell,
-                cost_cell,
-                Cell::from(format_ago(s)),
-                Cell::from(status_text).style(Style::default().fg(status_color)),
-            ])
+        .map(|d| match d {
+            DisplayRow::Session(s) => Row::new(session_cells(s, &cols)),
+            DisplayRow::Group(g) => {
+                Row::new(group_cells(g, &cols)).style(Style::default().bg(Color::Rgb(30, 30, 46)))
+            }
         })
         .collect();
 
-    let widths = [
-        Constraint::Length(7),
-        Constraint::Length(10),
-        Constraint::Length(22),
-        Constraint::Length(18),
-        Constraint::Length(9),
-        Constraint::Length(9),
-        Constraint::Length(9),
-        Constraint::Length(10),
-        Constraint::Length(5),
-        Constraint::Length(9),
-        Constraint::Length(8),
-        Constraint::Length(7),
-        Constraint::Min(8),
-    ];
+    let widths: Vec<Constraint> = cols.iter().map(|c| c.constraint()).collect();
 
+    let dir = if app.sort_reverse { "▲" } else { "▼" };
+    let grouped = if app.group { ", grouped" } else { "" };
     let title = if hidden > 0 {
         format!(
-            " sessions ({} of {} — {} hidden, press A) — sort: {} ",
-            sessions.len(),
-            sessions.len() + hidden,
+            " sessions ({} of {} — {} hidden, A) — sort: {} {}{} ",
+            session_count,
+            session_count + hidden,
             hidden,
-            sort_label(app.sort)
+            sort_label(app.sort),
+            dir,
+            grouped
         )
     } else {
         format!(
-            " sessions ({}) — sort: {} ",
-            sessions.len(),
-            sort_label(app.sort)
+            " sessions ({}) — sort: {} {}{} ",
+            session_count,
+            sort_label(app.sort),
+            dir,
+            grouped
         )
     };
 
@@ -380,31 +643,123 @@ fn draw_table(
     f.render_stateful_widget(table, area, &mut app.state);
 }
 
-fn draw_footer(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
+fn session_cells(s: &SessionView, cols: &[Col]) -> Vec<Cell<'static>> {
+    cols.iter().map(|c| session_cell(s, *c)).collect()
+}
+
+fn session_cell(s: &SessionView, col: Col) -> Cell<'static> {
+    match col {
+        Col::Src => {
+            let c = match s.kind {
+                AgentKind::Claude => Color::Magenta,
+                AgentKind::Codex => Color::Green,
+            };
+            Cell::from(s.kind.label()).style(Style::default().fg(c))
+        }
+        Col::Id => Cell::from(s.short_id()),
+        Col::Project => Cell::from(s.project_name()),
+        Col::Model => Cell::from(s.model.clone().unwrap_or_else(|| "-".into())),
+        Col::In => Cell::from(fmt_num(s.tokens.input)),
+        Col::Out => Cell::from(fmt_num(s.tokens.output)),
+        Col::Cache => Cell::from(fmt_num(s.tokens.cache_read + s.tokens.cache_creation)),
+        Col::Total => Cell::from(fmt_num(s.tokens.total()))
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+        Col::Ctx => match s.context_pct {
+            Some(p) => Cell::from(format!("{}%", (p * 100.0).round() as u64))
+                .style(Style::default().fg(context_color(p))),
+            None => Cell::from("·").style(Style::default().fg(Color::DarkGray)),
+        },
+        Col::Rate => {
+            let rate = s.tokens_last_60s;
+            if rate > 0 {
+                Cell::from(fmt_num(rate)).style(Style::default().fg(Color::Yellow))
+            } else {
+                Cell::from("·").style(Style::default().fg(Color::DarkGray))
+            }
+        }
+        Col::Cost => match s.cost_usd {
+            Some(c) if c >= 0.01 => {
+                Cell::from(format!("${:.2}", c)).style(Style::default().fg(Color::LightGreen))
+            }
+            Some(_) => Cell::from("<$0.01").style(Style::default().fg(Color::DarkGray)),
+            None => Cell::from("-").style(Style::default().fg(Color::DarkGray)),
+        },
+        Col::Ago => Cell::from(format_ago(s)),
+        Col::Status => {
+            let active = is_active(s);
+            let text = if active { "● active" } else { "  idle" };
+            let color = if active {
+                Color::Green
+            } else {
+                Color::DarkGray
+            };
+            Cell::from(text).style(Style::default().fg(color))
+        }
+    }
+}
+
+fn group_cells(g: &GroupHeader, cols: &[Col]) -> Vec<Cell<'static>> {
+    let arrow = if g.collapsed { "▸" } else { "▾" };
+    cols.iter()
+        .map(|c| match c {
+            Col::Src => Cell::from(arrow).style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Col::Project => Cell::from(format!("{} ({})", g.project, g.count)).style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Col::Total => {
+                Cell::from(fmt_num(g.tokens)).style(Style::default().add_modifier(Modifier::BOLD))
+            }
+            Col::Cost => {
+                Cell::from(format!("${:.2}", g.cost)).style(Style::default().fg(Color::LightGreen))
+            }
+            _ => Cell::from(""),
+        })
+        .collect()
+}
+
+fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    let dir = if app.sort_reverse { "▲" } else { "▼" };
     let visibility = if app.show_inactive { "all" } else { "running" };
-    let line = Line::from(vec![
+    let mut spans = vec![
         chip("q"),
         Span::raw(" quit  "),
         chip("↑↓/jk"),
         Span::raw(" nav  "),
         chip("⏎"),
         Span::raw(" detail  "),
-        chip("t"),
-        Span::raw(" tokens  "),
-        chip("c"),
-        Span::raw(" cost  "),
-        chip("m"),
-        Span::raw(" rate  "),
-        chip("a"),
-        Span::raw(" activity  "),
-        chip("p"),
-        Span::raw(" project  "),
-        chip("s"),
-        Span::raw(" source  "),
-        chip("A"),
-        Span::raw(format!(" show:{}", visibility)),
-    ]);
-    f.render_widget(Paragraph::new(line), area);
+        chip("g"),
+        Span::raw(" group  "),
+        chip("space"),
+        Span::raw(" pause  "),
+        chip("?"),
+        Span::raw(" help   "),
+        Span::styled(
+            format!("sort:{} {}  show:{}", sort_label(app.sort), dir, visibility),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ];
+    if app.group {
+        spans.push(Span::styled(
+            "  [grouped]",
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+    if app.paused {
+        spans.push(Span::styled(
+            "  [PAUSED]",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn chip(label: &str) -> Span<'_> {
@@ -443,6 +798,61 @@ fn centered_rect(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - pct_x) / 2),
         ])
         .split(vert[1])[1]
+}
+
+/// Full-screen key reference, toggled with `?`. Drawn over everything else.
+fn draw_help(f: &mut ratatui::Frame) {
+    let area = centered_rect(56, 80, f.area());
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(
+            " help ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let head = |t: &str| {
+        Line::from(Span::styled(
+            t.to_string(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    let row = |k: &str, d: &str| {
+        Line::from(vec![
+            Span::styled(format!("  {:<10}", k), Style::default().fg(Color::Yellow)),
+            Span::raw(d.to_string()),
+        ])
+    };
+
+    let lines = vec![
+        head("Navigation"),
+        row("↑/k ↓/j", "move selection"),
+        row("Enter", "open detail · collapse/expand group"),
+        row("q / Esc", "quit"),
+        Line::from(""),
+        head("Sort  (press again to reverse)"),
+        row("t", "total tokens"),
+        row("c", "cost ($)"),
+        row("m", "rate (tok/60s)"),
+        row("a", "last activity"),
+        row("p", "project"),
+        row("s", "source"),
+        Line::from(""),
+        head("View"),
+        row("g", "group by project (tree)"),
+        row("A", "show all vs. running only"),
+        row("Space", "pause / resume the display"),
+        row("?", "toggle this help"),
+    ];
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Modal detail overlay for one session: identity, token breakdown, cost,
@@ -629,6 +1039,15 @@ fn sort_label(s: SortBy) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{AgentKind, Session};
+    use std::path::PathBuf;
+
+    fn view_for(project: &str, out: u64) -> SessionView {
+        let mut s = Session::new(AgentKind::Claude, PathBuf::from("/tmp/x.jsonl"));
+        s.cwd = Some(project.into());
+        s.tokens.output = out;
+        s.view()
+    }
 
     #[test]
     fn fmt_num_buckets() {
@@ -653,5 +1072,73 @@ mod tests {
         assert_eq!(format_ago_secs(47 * 3_600), "47h");
         assert_eq!(format_ago_secs(48 * 3_600), "2d");
         assert_eq!(format_ago_secs(10 * 24 * 3_600), "10d");
+    }
+
+    #[test]
+    fn visible_columns_keep_essentials_and_drop_heavy_first() {
+        // Wide terminal shows everything in canonical order.
+        let wide = visible_columns(200);
+        assert_eq!(wide, CANONICAL.to_vec());
+
+        // Narrow terminal keeps the essential identity/cost columns…
+        let narrow = visible_columns(70);
+        for c in [
+            Col::Src,
+            Col::Project,
+            Col::Total,
+            Col::Cost,
+            Col::Ago,
+            Col::Status,
+        ] {
+            assert!(narrow.contains(&c), "essential column dropped");
+        }
+        // …and sheds CACHE/IN/OUT first.
+        assert!(!narrow.contains(&Col::Cache));
+        assert!(!narrow.contains(&Col::In));
+        assert!(!narrow.contains(&Col::Out));
+
+        // Whatever survives stays in canonical left-to-right order.
+        let positions: Vec<usize> = narrow
+            .iter()
+            .map(|c| CANONICAL.iter().position(|x| x == c).unwrap())
+            .collect();
+        assert!(positions.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn build_display_flat_when_ungrouped() {
+        let a = view_for("/w/alpha", 1);
+        let b = view_for("/w/beta", 2);
+        let refs = vec![&a, &b];
+        let rows = build_display(&refs, false, &HashSet::new());
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(rows[0], DisplayRow::Session(_)));
+    }
+
+    #[test]
+    fn build_display_groups_with_subtotals_and_collapse() {
+        let a = view_for("/w/alpha", 100);
+        let b = view_for("/w/alpha", 50);
+        let c = view_for("/w/beta", 10);
+        let refs = vec![&a, &b, &c];
+
+        // Two group headers + three sessions.
+        let grouped = build_display(&refs, true, &HashSet::new());
+        assert_eq!(grouped.len(), 5);
+        match &grouped[0] {
+            DisplayRow::Group(g) => {
+                assert_eq!(g.project, "alpha");
+                assert_eq!(g.count, 2);
+                assert_eq!(g.tokens, 150);
+            }
+            _ => panic!("expected group header first"),
+        }
+
+        // Collapsing alpha hides its two sessions: alpha header + beta header +
+        // beta's one session = 3 rows.
+        let mut collapsed = HashSet::new();
+        collapsed.insert("alpha".to_string());
+        let partial = build_display(&refs, true, &collapsed);
+        assert_eq!(partial.len(), 3);
     }
 }
