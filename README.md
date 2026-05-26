@@ -15,7 +15,7 @@
 │ codex   019e1d9b   joinway-learn-ai    gpt-5.5            8.5M   12%         ·    $0.86  1d     idle  │
 │ ...                                                                                            │
 └────────────────────────────────────────────────────────────────────────────────────────┘
- q  quit   ↑↓/jk  nav   ⏎  detail   t  tokens   c  cost   m  rate   a  activity   p  project   s  source   A  show:running
+ q quit  ↑↓/jk nav  ⏎ detail  g group  space pause  ? help   sort:cost ▼  show:running
 ```
 
 ## Install
@@ -211,12 +211,15 @@ Edit and rebuild to fit your situation.
 - [x] Detail view (Enter on a row): token sparkline, in/out/cache breakdown, context-window gauge, model, path, cost
 - [x] Context-window fill gauge (`CTX` column + detail view)
 - [x] `--json` exporter for scripting / Grafana
+- [x] Group-by-project tree view (`g`) with per-project subtotals
+- [x] Adaptive layout: drops CACHE/IN/OUT/etc. on narrow terminals
+- [x] Help overlay (`?`), pause (`Space`), reverse sort (repeat sort key)
+- [x] Daily / weekly report mode (`agtop report --since=7d`)
 - [ ] `--prom` (Prometheus) exporter
 - [ ] Detail view extras: recent tool calls, model swaps, file edits
 - [ ] Search / filter (`/` like vim)
 - [ ] More agents: Cursor, Aider, Gemini CLI, Goose
 - [ ] macOS menubar widget showing live `tok/min`
-- [ ] Daily / weekly report mode (`agtop report --since=7d`)
 
 ## Contributing
 
