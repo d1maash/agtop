@@ -7,6 +7,7 @@ mod ui;
 mod watcher;
 
 use anyhow::Result;
+use chrono::{DateTime, Duration, Utc};
 use clap::{Parser, Subcommand};
 use model::Session;
 use serde::Serialize;
@@ -27,6 +28,15 @@ struct Cli {
     /// Print only the JSONL files of currently-running CLI sessions, then exit.
     #[arg(long)]
     running: bool,
+    /// Only parse session files modified within this window at startup
+    /// (e.g. 7d, 24h, 30m). Defaults to 30d. Older files are picked up
+    /// lazily when they become active. Use `--all` to disable filtering.
+    #[arg(long, value_name = "WINDOW", default_value = "30d")]
+    scan_since: String,
+    /// Parse every session file at startup regardless of mtime. Slower on
+    /// machines with thousands of historical sessions.
+    #[arg(long)]
+    all: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -102,6 +112,7 @@ fn main() -> Result<()> {
     if let Some(Command::Report { since, json }) = cli.command {
         return report::run(since, json);
     }
+    let cutoff: Option<DateTime<Utc>> = resolve_cutoff(cli.all, &cli.scan_since)?;
     if cli.running {
         match processes::running_session_paths() {
             Some(set) if set.is_empty() => {
@@ -121,7 +132,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
     if cli.json {
-        let map = sources::initial_scan()?;
+        let map = sources::initial_scan_since(cutoff)?;
         let mut sessions: Vec<_> = map.into_values().collect();
         sessions.sort_by_key(|s| std::cmp::Reverse(s.last_activity));
         let out: Vec<SessionJson> = sessions.iter().map(SessionJson::from_session).collect();
@@ -129,7 +140,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
     if cli.once {
-        let map = sources::initial_scan()?;
+        let map = sources::initial_scan_since(cutoff)?;
         let mut sessions: Vec<_> = map.into_values().collect();
         sessions.sort_by_key(|s| std::cmp::Reverse(s.last_activity));
         println!(
@@ -154,9 +165,25 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
-    let (shared, map) = watcher::build_initial_state();
-    watcher::spawn(shared.clone(), map)?;
+    let (shared, map) = watcher::build_initial_state(cutoff);
+    watcher::spawn(shared.clone(), map, cutoff)?;
     ui::run(shared)
+}
+
+/// Translate `--all` / `--scan-since` into the optional UTC cutoff that the
+/// watcher and initial-scan share. `--all` wins over `--scan-since`. Empty or
+/// `"all"` values for `--scan-since` also mean "no filter" so users can opt
+/// out without remembering a second flag.
+fn resolve_cutoff(all: bool, scan_since: &str) -> Result<Option<DateTime<Utc>>> {
+    if all {
+        return Ok(None);
+    }
+    let trimmed = scan_since.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("all") {
+        return Ok(None);
+    }
+    let dur: Duration = report::parse_since(trimmed)?;
+    Ok(Some(Utc::now() - dur))
 }
 
 fn truncate(s: &str, n: usize) -> String {

@@ -111,13 +111,37 @@ pub fn spawn(
             if now.duration_since(last_safety) >= safety_scan {
                 last_safety = now;
 
+                // Discover newly-created files that notify may have missed.
+                // The mtime cutoff (when set) keeps long-dormant logs out of
+                // the map at safety-scan time too — otherwise we'd undo the
+                // lazy initial scan 15 seconds after startup. Files that
+                // become active later are still picked up via notify events.
                 for (kind, path) in sources::list_files() {
                     if let std::collections::hash_map::Entry::Vacant(e) = map.entry(path.clone()) {
+                        if !sources::passes_cutoff(&path, cutoff) {
+                            continue;
+                        }
                         let mut sess = Session::new(kind, path);
                         let _ = sources::tail(&mut sess, true);
                         e.insert(sess);
                         dirty = true;
                     }
+                }
+                // Drop sessions whose underlying file disappeared (deleted or
+                // rotated to a different name). Without this the map only ever
+                // grows. Tracked entries with vanished files would also fail
+                // every subsequent `tail` stat call, so dropping them is both
+                // a memory and a syscall win.
+                let removed: Vec<PathBuf> = map
+                    .iter()
+                    .filter(|(p, _)| !p.exists())
+                    .map(|(p, _)| p.clone())
+                    .collect();
+                if !removed.is_empty() {
+                    for p in &removed {
+                        map.remove(p);
+                    }
+                    dirty = true;
                 }
                 // Re-tail anything that grew, in case events were dropped.
                 // `tail` short-circuits on metadata.len() == file_offset, so

@@ -162,3 +162,42 @@ pub fn passes_cutoff(path: &Path, cutoff: Option<DateTime<Utc>>) -> bool {
     };
     DateTime::<Utc>::from(modified) >= cutoff
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+    use std::io::Write;
+
+    #[test]
+    fn passes_cutoff_none_means_no_filter() {
+        // Pass a path that doesn't exist; with `None`, we always return true
+        // and never touch the filesystem.
+        let p = Path::new("/nonexistent/path/that/does/not/exist.jsonl");
+        assert!(passes_cutoff(p, None));
+    }
+
+    #[test]
+    fn passes_cutoff_missing_file_is_excluded() {
+        let cutoff = Utc::now() - Duration::days(1);
+        let p = Path::new("/nonexistent/path/that/does/not/exist.jsonl");
+        assert!(!passes_cutoff(p, Some(cutoff)));
+    }
+
+    #[test]
+    fn passes_cutoff_fresh_file_passes_and_old_does_not() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("agtop-passes-cutoff-{}.jsonl", std::process::id()));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "x").unwrap();
+        }
+        // Cutoff in the past → the just-created file is newer.
+        let recent_cutoff = Utc::now() - Duration::hours(1);
+        assert!(passes_cutoff(&path, Some(recent_cutoff)));
+        // Cutoff in the future → no real file is newer than that.
+        let future_cutoff = Utc::now() + Duration::hours(1);
+        assert!(!passes_cutoff(&path, Some(future_cutoff)));
+        let _ = std::fs::remove_file(&path);
+    }
+}
