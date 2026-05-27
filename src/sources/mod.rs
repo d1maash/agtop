@@ -124,8 +124,20 @@ pub fn tail(session: &mut Session, live: bool) -> Result<bool> {
 /// Initial pass: parse everything, do not contribute to live rate window.
 /// Parallelised so startup with hundreds of jsonls stays sub-second.
 pub fn initial_scan() -> Result<HashMap<PathBuf, Session>> {
+    initial_scan_since(None)
+}
+
+/// Filtered initial pass: skip files whose mtime is older than `cutoff`. Old
+/// sessions stay out of the map at startup and are picked up lazily by the
+/// watcher only when they become active (a notify event fires for them). The
+/// safety-scan applies the same cutoff so it doesn't undo this filtering 15s
+/// later. Pass `None` for a full scan (behaviour identical to `initial_scan`).
+pub fn initial_scan_since(
+    cutoff: Option<DateTime<Utc>>,
+) -> Result<HashMap<PathBuf, Session>> {
     let map: HashMap<PathBuf, Session> = list_files()
         .into_par_iter()
+        .filter(|(_, p)| passes_cutoff(p, cutoff))
         .map(|(kind, path)| {
             let mut sess = Session::new(kind, path.clone());
             let _ = tail(&mut sess, false);
@@ -133,4 +145,20 @@ pub fn initial_scan() -> Result<HashMap<PathBuf, Session>> {
         })
         .collect();
     Ok(map)
+}
+
+/// `true` when `path`'s mtime is at or after `cutoff`. A missing cutoff means
+/// "no filter". A missing/unreadable mtime is treated as old (skipped) to keep
+/// startup fast; the watcher will still notice the file if it grows later.
+pub fn passes_cutoff(path: &Path, cutoff: Option<DateTime<Utc>>) -> bool {
+    let Some(cutoff) = cutoff else {
+        return true;
+    };
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    let Ok(modified) = meta.modified() else {
+        return false;
+    };
+    DateTime::<Utc>::from(modified) >= cutoff
 }

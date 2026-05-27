@@ -1,6 +1,7 @@
 use crate::model::{AgentKind, Session, SessionView};
 use crate::sources;
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use notify::event::ModifyKind;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
@@ -26,9 +27,10 @@ pub fn current(shared: &Shared) -> Snapshot {
 
 /// Parse every known jsonl up-front and seed the first snapshot. Returns the
 /// shared cell plus the owned `HashMap` that the watcher thread will keep
-/// mutating in place.
-pub fn build_initial_state() -> (Shared, HashMap<PathBuf, Session>) {
-    let map = sources::initial_scan().unwrap_or_default();
+/// mutating in place. `cutoff` skips files older than that timestamp at boot;
+/// pass `None` to fully scan everything.
+pub fn build_initial_state(cutoff: Option<DateTime<Utc>>) -> (Shared, HashMap<PathBuf, Session>) {
+    let map = sources::initial_scan_since(cutoff).unwrap_or_default();
     let snap: Vec<SessionView> = map.values().map(Session::view).collect();
     let shared = Arc::new(Mutex::new(Arc::new(snap)));
     (shared, map)
@@ -44,7 +46,11 @@ fn publish(shared: &Shared, map: &HashMap<PathBuf, Session>) {
 /// (no locks during file IO), debounces filesystem events for `debounce`,
 /// re-tails affected files, and republishes a snapshot when anything
 /// actually changed — throttled so a burst of events doesn't thrash.
-pub fn spawn(shared: Shared, mut map: HashMap<PathBuf, Session>) -> Result<()> {
+pub fn spawn(
+    shared: Shared,
+    mut map: HashMap<PathBuf, Session>,
+    cutoff: Option<DateTime<Utc>>,
+) -> Result<()> {
     let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
     let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |res| {
         let _ = tx.send(res);
