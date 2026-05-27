@@ -1,6 +1,7 @@
 use crate::model::{AgentKind, Session, SessionView};
 use crate::sources;
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use notify::event::ModifyKind;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
@@ -26,9 +27,10 @@ pub fn current(shared: &Shared) -> Snapshot {
 
 /// Parse every known jsonl up-front and seed the first snapshot. Returns the
 /// shared cell plus the owned `HashMap` that the watcher thread will keep
-/// mutating in place.
-pub fn build_initial_state() -> (Shared, HashMap<PathBuf, Session>) {
-    let map = sources::initial_scan().unwrap_or_default();
+/// mutating in place. `cutoff` skips files older than that timestamp at boot;
+/// pass `None` to fully scan everything.
+pub fn build_initial_state(cutoff: Option<DateTime<Utc>>) -> (Shared, HashMap<PathBuf, Session>) {
+    let map = sources::initial_scan_since(cutoff).unwrap_or_default();
     let snap: Vec<SessionView> = map.values().map(Session::view).collect();
     let shared = Arc::new(Mutex::new(Arc::new(snap)));
     (shared, map)
@@ -44,7 +46,11 @@ fn publish(shared: &Shared, map: &HashMap<PathBuf, Session>) {
 /// (no locks during file IO), debounces filesystem events for `debounce`,
 /// re-tails affected files, and republishes a snapshot when anything
 /// actually changed — throttled so a burst of events doesn't thrash.
-pub fn spawn(shared: Shared, mut map: HashMap<PathBuf, Session>) -> Result<()> {
+pub fn spawn(
+    shared: Shared,
+    mut map: HashMap<PathBuf, Session>,
+    cutoff: Option<DateTime<Utc>>,
+) -> Result<()> {
     let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
     let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |res| {
         let _ = tx.send(res);
@@ -105,13 +111,37 @@ pub fn spawn(shared: Shared, mut map: HashMap<PathBuf, Session>) -> Result<()> {
             if now.duration_since(last_safety) >= safety_scan {
                 last_safety = now;
 
+                // Discover newly-created files that notify may have missed.
+                // The mtime cutoff (when set) keeps long-dormant logs out of
+                // the map at safety-scan time too — otherwise we'd undo the
+                // lazy initial scan 15 seconds after startup. Files that
+                // become active later are still picked up via notify events.
                 for (kind, path) in sources::list_files() {
                     if let std::collections::hash_map::Entry::Vacant(e) = map.entry(path.clone()) {
+                        if !sources::passes_cutoff(&path, cutoff) {
+                            continue;
+                        }
                         let mut sess = Session::new(kind, path);
                         let _ = sources::tail(&mut sess, true);
                         e.insert(sess);
                         dirty = true;
                     }
+                }
+                // Drop sessions whose underlying file disappeared (deleted or
+                // rotated to a different name). Without this the map only ever
+                // grows. Tracked entries with vanished files would also fail
+                // every subsequent `tail` stat call, so dropping them is both
+                // a memory and a syscall win.
+                let removed: Vec<PathBuf> = map
+                    .iter()
+                    .filter(|(p, _)| !p.exists())
+                    .map(|(p, _)| p.clone())
+                    .collect();
+                if !removed.is_empty() {
+                    for p in &removed {
+                        map.remove(p);
+                    }
+                    dirty = true;
                 }
                 // Re-tail anything that grew, in case events were dropped.
                 // `tail` short-circuits on metadata.len() == file_offset, so

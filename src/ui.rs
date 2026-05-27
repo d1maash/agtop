@@ -2,7 +2,7 @@ use crate::model::{AgentKind, SessionView};
 use crate::processes::RunningSnapshot;
 use crate::watcher::{current, Shared, Snapshot};
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{DateTime, Local, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -957,17 +957,11 @@ fn draw_detail(f: &mut ratatui::Frame, s: &SessionView) {
         ]),
         Line::from(vec![
             label("started"),
-            Span::raw(
-                s.started_at
-                    .map(|t| format_ago_secs((Utc::now() - t).num_seconds()))
-                    .unwrap_or_else(|| dash.clone()),
-            ),
-            Span::raw(" ago"),
+            Span::raw(format_local_with_ago(s.started_at, &dash)),
         ]),
         Line::from(vec![
             label("last"),
-            Span::raw(format_ago(s)),
-            Span::raw(" ago"),
+            Span::raw(format_local_with_ago(s.last_activity, &dash)),
         ]),
     ];
     f.render_widget(Paragraph::new(info), rows[0]);
@@ -994,6 +988,19 @@ fn format_ago(s: &SessionView) -> String {
         return "-".into();
     };
     format_ago_secs((Utc::now() - t).num_seconds())
+}
+
+/// Render an absolute timestamp in the user's local timezone alongside the
+/// relative "X ago" delta — the detail overlay needs both: the delta tells you
+/// when something happened relative to now, the wall clock tells you when it
+/// happened in the day. Falls back to `dash` when the timestamp is unknown.
+fn format_local_with_ago(t: Option<DateTime<Utc>>, dash: &str) -> String {
+    let Some(t) = t else {
+        return dash.to_string();
+    };
+    let local = t.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S");
+    let ago = format_ago_secs((Utc::now() - t).num_seconds());
+    format!("{local}  ({ago} ago)")
 }
 
 fn format_ago_secs(secs: i64) -> String {
@@ -1059,6 +1066,19 @@ mod tests {
         assert_eq!(fmt_num(999_999), "1000.0k");
         assert_eq!(fmt_num(1_000_000), "1.0M");
         assert_eq!(fmt_num(2_500_000), "2.5M");
+    }
+
+    #[test]
+    fn format_local_with_ago_includes_clock_and_delta() {
+        // None → dash.
+        assert_eq!(format_local_with_ago(None, "-"), "-");
+        // 30s ago: rendered as "YYYY-MM-DD HH:MM:SS  (30s ago)" in local TZ.
+        let t = Utc::now() - chrono::Duration::seconds(30);
+        let s = format_local_with_ago(Some(t), "-");
+        assert!(s.contains("ago)"), "missing relative suffix: {s}");
+        // The wall-clock portion ends with seconds, so the line should
+        // contain two ':' characters (HH:MM:SS).
+        assert!(s.matches(':').count() >= 2, "missing wall clock: {s}");
     }
 
     #[test]

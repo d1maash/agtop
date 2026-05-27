@@ -15,7 +15,7 @@
 │ codex   019e1d9b   joinway-learn-ai    gpt-5.5            8.5M   12%         ·    $0.86  1d     idle  │
 │ ...                                                                                            │
 └────────────────────────────────────────────────────────────────────────────────────────┘
- q  quit   ↑↓/jk  nav   ⏎  detail   t  tokens   c  cost   m  rate   a  activity   p  project   s  source   A  show:running
+ q quit  ↑↓/jk nav  ⏎ detail  g group  space pause  ? help   sort:cost ▼  show:running
 ```
 
 ## Install
@@ -43,10 +43,12 @@ cargo install --git https://github.com/d1maash/agtop
 ## Usage
 
 ```bash
-agtop            # live TUI (refreshes as session logs grow)
-agtop --once     # one-shot table dump to stdout (good for scripts / cron)
-agtop --json     # one-shot JSON dump (scripting, cron reports, Grafana)
-agtop --running  # list JSONL files of currently-running CLI sessions, then exit
+agtop                       # live TUI (refreshes as session logs grow)
+agtop --once                # one-shot table dump to stdout (good for scripts / cron)
+agtop --json                # one-shot JSON dump (scripting, cron reports, Grafana)
+agtop --running             # list JSONL files of currently-running CLI sessions
+agtop report --since=7d     # offline usage report: by day, project, model, top sessions
+agtop report --since=7d --json
 agtop --version
 ```
 
@@ -86,19 +88,24 @@ to find sessions approaching auto-compaction.
 
 ### Keys
 
-| Key       | Action                                        |
-| --------- | --------------------------------------------- |
-| `q` / Esc | Quit                                          |
-| `↑` / `k` | Move selection up                             |
-| `↓` / `j` | Move selection down                           |
-| `Enter`   | Open detail view for the selected session (Esc/Enter to close) |
-| `t`       | Sort by total tokens                          |
-| `c`       | Sort by cost ($)                              |
-| `m`       | Sort by current rate (tokens in last 60s)     |
-| `a`       | Sort by last activity                         |
-| `p`       | Sort by project name                          |
-| `s`       | Sort by source (claude / codex)               |
-| `A`       | Toggle: show only running sessions vs. all    |
+Press `?` inside the TUI for the same reference. Pressing any sort key a second time **reverses** the order; the title bar shows the active direction (`▼` / `▲`).
+
+| Key       | Action                                                          |
+| --------- | --------------------------------------------------------------- |
+| `q` / Esc | Quit                                                            |
+| `?`       | Toggle the full key-reference overlay                           |
+| `↑` / `k` | Move selection up                                               |
+| `↓` / `j` | Move selection down                                             |
+| `Enter`   | Open detail for the selected session, or collapse/expand a group |
+| `t`       | Sort by total tokens (repeat to reverse)                        |
+| `c`       | Sort by cost ($) (repeat to reverse)                            |
+| `m`       | Sort by current rate (tokens in last 60s) (repeat to reverse)   |
+| `a`       | Sort by last activity (repeat to reverse)                       |
+| `p`       | Sort by project name (repeat to reverse)                        |
+| `s`       | Sort by source (claude / codex) (repeat to reverse)             |
+| `g`       | Group by project (tree view with per-project subtotals)         |
+| `Space`   | Pause / resume the display (freezes fast-moving numbers)        |
+| `A`       | Toggle: show only running sessions vs. all                      |
 
 ## Columns
 
@@ -118,7 +125,15 @@ to find sessions approaching auto-compaction.
 | `AGO`       | Time since last activity                                                      |
 | `STATUS`    | `● active` if last activity is within 2 minutes, otherwise `idle`             |
 
-The header row also shows aggregate totals across all visible sessions: token count, total $, and the global last-60s token sum.
+The header row also shows aggregate totals across all visible sessions: token count, total $, and the global last-60s token sum. On narrow terminals the table sheds optional columns automatically — `CACHE`, then `IN`/`OUT`, then `ID`/`MODEL`/`TOK/60S`/`CTX` — keeping `SRC`, `PROJECT`, `TOTAL`, `$`, `AGO`, and `STATUS` visible at all sizes. The header line trims its lowest-priority segments the same way.
+
+### Grouping (tree view)
+
+Press `g` to switch into the tree view. Sessions are grouped by project, with a subtotal header row per project showing the total tokens and cost across its sessions. Press `Enter` on a header row to collapse or expand that group; press `g` again to leave grouping. The active mode is shown in the table title (`, grouped`) and footer.
+
+### Pause
+
+Press `Space` to freeze the display — useful for reading or screenshotting fast-moving numbers. A yellow `[PAUSED]` chip appears in the footer; press `Space` again to resume. The watcher keeps parsing in the background; only the displayed snapshot is held.
 
 ## Detail view
 
@@ -128,6 +143,20 @@ samples that feed `TOK/60S`), the full in / out / cache-read / cache-write
 breakdown, turn count, cost, the context-window gauge (`used / max (pct)`,
 color-coded), model, file path, and start/last-activity times. `Esc` or `Enter`
 closes it.
+
+## Report
+
+`agtop report` is an offline summary that reuses the same parsers (and the same `pricing.rs` table) as the live TUI, so the totals match. It walks every known JSONL once, aggregates, and prints:
+
+```bash
+agtop report                  # all history
+agtop report --since=7d       # last 7 days
+agtop report --since=24h --json
+```
+
+`--since` accepts `s` / `m` / `h` / `d` / `w` (e.g. `90s`, `30m`, `24h`, `7d`, `2w`). A session is included when its **last-activity** timestamp falls inside the window — whole sessions, not per-event splitting, so a session that crosses midnight counts in the day it last wrote.
+
+The text output has four sections: totals, by-day (chronological), by-project and by-model (sorted by cost), and the top 10 sessions by cost. `--json` emits the same data as a structured object with stable field names.
 
 ## How it works
 
@@ -182,12 +211,15 @@ Edit and rebuild to fit your situation.
 - [x] Detail view (Enter on a row): token sparkline, in/out/cache breakdown, context-window gauge, model, path, cost
 - [x] Context-window fill gauge (`CTX` column + detail view)
 - [x] `--json` exporter for scripting / Grafana
+- [x] Group-by-project tree view (`g`) with per-project subtotals
+- [x] Adaptive layout: drops CACHE/IN/OUT/etc. on narrow terminals
+- [x] Help overlay (`?`), pause (`Space`), reverse sort (repeat sort key)
+- [x] Daily / weekly report mode (`agtop report --since=7d`)
 - [ ] `--prom` (Prometheus) exporter
 - [ ] Detail view extras: recent tool calls, model swaps, file edits
 - [ ] Search / filter (`/` like vim)
 - [ ] More agents: Cursor, Aider, Gemini CLI, Goose
 - [ ] macOS menubar widget showing live `tok/min`
-- [ ] Daily / weekly report mode (`agtop report --since=7d`)
 
 ## Contributing
 

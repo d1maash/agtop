@@ -124,8 +124,20 @@ pub fn tail(session: &mut Session, live: bool) -> Result<bool> {
 /// Initial pass: parse everything, do not contribute to live rate window.
 /// Parallelised so startup with hundreds of jsonls stays sub-second.
 pub fn initial_scan() -> Result<HashMap<PathBuf, Session>> {
+    initial_scan_since(None)
+}
+
+/// Filtered initial pass: skip files whose mtime is older than `cutoff`. Old
+/// sessions stay out of the map at startup and are picked up lazily by the
+/// watcher only when they become active (a notify event fires for them). The
+/// safety-scan applies the same cutoff so it doesn't undo this filtering 15s
+/// later. Pass `None` for a full scan (behaviour identical to `initial_scan`).
+pub fn initial_scan_since(
+    cutoff: Option<DateTime<Utc>>,
+) -> Result<HashMap<PathBuf, Session>> {
     let map: HashMap<PathBuf, Session> = list_files()
         .into_par_iter()
+        .filter(|(_, p)| passes_cutoff(p, cutoff))
         .map(|(kind, path)| {
             let mut sess = Session::new(kind, path.clone());
             let _ = tail(&mut sess, false);
@@ -133,4 +145,59 @@ pub fn initial_scan() -> Result<HashMap<PathBuf, Session>> {
         })
         .collect();
     Ok(map)
+}
+
+/// `true` when `path`'s mtime is at or after `cutoff`. A missing cutoff means
+/// "no filter". A missing/unreadable mtime is treated as old (skipped) to keep
+/// startup fast; the watcher will still notice the file if it grows later.
+pub fn passes_cutoff(path: &Path, cutoff: Option<DateTime<Utc>>) -> bool {
+    let Some(cutoff) = cutoff else {
+        return true;
+    };
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    let Ok(modified) = meta.modified() else {
+        return false;
+    };
+    DateTime::<Utc>::from(modified) >= cutoff
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+    use std::io::Write;
+
+    #[test]
+    fn passes_cutoff_none_means_no_filter() {
+        // Pass a path that doesn't exist; with `None`, we always return true
+        // and never touch the filesystem.
+        let p = Path::new("/nonexistent/path/that/does/not/exist.jsonl");
+        assert!(passes_cutoff(p, None));
+    }
+
+    #[test]
+    fn passes_cutoff_missing_file_is_excluded() {
+        let cutoff = Utc::now() - Duration::days(1);
+        let p = Path::new("/nonexistent/path/that/does/not/exist.jsonl");
+        assert!(!passes_cutoff(p, Some(cutoff)));
+    }
+
+    #[test]
+    fn passes_cutoff_fresh_file_passes_and_old_does_not() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("agtop-passes-cutoff-{}.jsonl", std::process::id()));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "x").unwrap();
+        }
+        // Cutoff in the past → the just-created file is newer.
+        let recent_cutoff = Utc::now() - Duration::hours(1);
+        assert!(passes_cutoff(&path, Some(recent_cutoff)));
+        // Cutoff in the future → no real file is newer than that.
+        let future_cutoff = Utc::now() + Duration::hours(1);
+        assert!(!passes_cutoff(&path, Some(future_cutoff)));
+        let _ = std::fs::remove_file(&path);
+    }
 }
