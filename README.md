@@ -106,6 +106,7 @@ Press `?` inside the TUI for the same reference. Pressing any sort key a second 
 | `g`       | Group by project (tree view with per-project subtotals)         |
 | `Space`   | Pause / resume the display (freezes fast-moving numbers)        |
 | `A`       | Toggle: show only running sessions vs. all                      |
+| `/`       | Live substring filter on project, model, id, or path            |
 
 ## Columns
 

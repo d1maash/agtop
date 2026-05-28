@@ -9,7 +9,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Sparkline, Table, TableState};
@@ -52,6 +52,12 @@ enum SortBy {
     Cost,
     Rate,
     Source,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InputMode {
+    Normal,
+    Filtering,
 }
 
 /// One column of the session table. The set actually rendered is chosen at draw
@@ -217,6 +223,10 @@ struct App {
     group: bool,
     /// Project names whose group is collapsed (children hidden).
     collapsed: HashSet<String>,
+    /// Current input mode (normal navigation vs. typing a filter).
+    input_mode: InputMode,
+    /// Active substring filter (case-insensitive). Empty means no filter.
+    filter: String,
 }
 
 impl App {
@@ -236,6 +246,8 @@ impl App {
             frozen: None,
             group: false,
             collapsed: HashSet::new(),
+            input_mode: InputMode::Normal,
+            filter: String::new(),
         }
     }
 
@@ -271,6 +283,19 @@ impl App {
                 }
             }
         }
+
+        // Live substring filter (case-insensitive). Matches project, model,
+        // short id, or full cwd. Applied after the running-only filter.
+        if !self.filter.is_empty() {
+            let f = self.filter.to_lowercase();
+            v.retain(|s| {
+                s.project_name().to_lowercase().contains(&f)
+                    || s.model.as_deref().unwrap_or("").to_lowercase().contains(&f)
+                    || s.short_id().to_lowercase().contains(&f)
+                    || s.cwd.as_deref().unwrap_or("").to_lowercase().contains(&f)
+            });
+        }
+
         sort_sessions(&mut v, self.sort, self.sort_reverse);
         v
     }
@@ -410,8 +435,37 @@ fn main_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, shared: Shared) 
                     }
                     continue;
                 }
+
+                // Filter input mode: capture typing, backspace, and exit keys.
+                if app.input_mode == InputMode::Filtering {
+                    match k.code {
+                        KeyCode::Esc | KeyCode::Enter => {
+                            app.input_mode = InputMode::Normal;
+                        }
+                        KeyCode::Backspace => {
+                            app.filter.pop();
+                        }
+                        KeyCode::Char(c) => {
+                            // Ignore control chars that slip through.
+                            if !c.is_control() {
+                                app.filter.push(c);
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                // Normal mode key handling.
                 match k.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('q') | KeyCode::Esc => {
+                        if !app.filter.is_empty() {
+                            // Esc clears active filter instead of quitting.
+                            app.filter.clear();
+                        } else {
+                            break;
+                        }
+                    }
                     KeyCode::Char('?') => app.show_help = true,
                     KeyCode::Char(' ') => {
                         app.paused = !app.paused;
@@ -438,6 +492,9 @@ fn main_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, shared: Shared) 
                     KeyCode::Char('s') => app.set_sort(SortBy::Source),
                     KeyCode::Char('g') => app.group = !app.group,
                     KeyCode::Char('A') => app.show_inactive = !app.show_inactive,
+                    KeyCode::Char('/') => {
+                        app.input_mode = InputMode::Filtering;
+                    }
                     _ => {}
                 }
             }
@@ -455,14 +512,28 @@ fn draw(
     detail: Option<&SessionView>,
     now: DateTime<Utc>,
 ) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
-        .split(f.area());
+    let show_filter_bar = app.input_mode == InputMode::Filtering || !app.filter.is_empty();
+
+    let chunks = if show_filter_bar {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(0),
+                Constraint::Length(1), // filter bar
+                Constraint::Length(1), // footer
+            ])
+            .split(f.area())
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
+            .split(f.area())
+    };
 
     draw_header(f, chunks[0], sessions, now);
     draw_table(
@@ -477,7 +548,13 @@ fn draw(
         hidden,
         now,
     );
-    draw_footer(f, chunks[2], app);
+
+    if show_filter_bar {
+        draw_filter_bar(f, chunks[2], app);
+        draw_footer(f, chunks[3], app);
+    } else {
+        draw_footer(f, chunks[2], app);
+    }
 
     if let Some(s) = detail {
         draw_detail(f, s, now);
@@ -793,6 +870,36 @@ fn chip(label: &str) -> Span<'_> {
     )
 }
 
+fn draw_filter_bar(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    let is_editing = app.input_mode == InputMode::Filtering;
+
+    let content = if is_editing {
+        // Active prompt while the user is typing the filter.
+        format!(" / {}", app.filter)
+    } else {
+        // Subtle indicator when a filter is active but we're back in normal mode.
+        format!(" filter: \"{}\"", app.filter)
+    };
+
+    let style = if is_editing {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let p = Paragraph::new(content).style(style);
+    f.render_widget(p, area);
+
+    if is_editing {
+        // Real terminal cursor right after the prompt + typed text.
+        // " / " is 3 characters.
+        let prompt_len: u16 = 3;
+        let cursor_x = area.x + prompt_len + app.filter.chars().count() as u16;
+        let cursor_y = area.y;
+        f.set_cursor_position(Position { x: cursor_x, y: cursor_y });
+    }
+}
+
 /// Green well below the limit, yellow approaching it, red near auto-compaction.
 fn context_color(pct: f64) -> Color {
     if pct >= 0.9 {
@@ -875,6 +982,11 @@ fn draw_help(f: &mut ratatui::Frame) {
         row("A", "show all vs. running only"),
         row("Space", "pause / resume the display"),
         row("?", "toggle this help"),
+        Line::from(""),
+        head("Filter"),
+        row("/", "start typing a live filter (project / model / id / path)"),
+        row("Esc / Enter", "exit filter mode (filter stays active)"),
+        row("Esc (normal)", "clear active filter"),
     ];
     f.render_widget(Paragraph::new(lines), inner);
 }
