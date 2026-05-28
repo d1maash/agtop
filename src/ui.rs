@@ -9,7 +9,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Sparkline, Table, TableState};
@@ -52,6 +52,12 @@ enum SortBy {
     Cost,
     Rate,
     Source,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InputMode {
+    Normal,
+    Filtering,
 }
 
 /// One column of the session table. The set actually rendered is chosen at draw
@@ -217,6 +223,10 @@ struct App {
     group: bool,
     /// Project names whose group is collapsed (children hidden).
     collapsed: HashSet<String>,
+    /// Current input mode (normal navigation vs. typing a filter).
+    input_mode: InputMode,
+    /// Active substring filter (case-insensitive). Empty means no filter.
+    filter: String,
 }
 
 impl App {
@@ -236,6 +246,8 @@ impl App {
             frozen: None,
             group: false,
             collapsed: HashSet::new(),
+            input_mode: InputMode::Normal,
+            filter: String::new(),
         }
     }
 
@@ -257,7 +269,7 @@ impl App {
 
     /// Returns a sorted+filtered list of refs into the snapshot. No session
     /// bodies are copied — sorting operates on `&SessionView`.
-    fn view<'a>(&self, snap: &'a [SessionView]) -> Vec<&'a SessionView> {
+    fn view<'a>(&self, snap: &'a [SessionView], now: DateTime<Utc>) -> Vec<&'a SessionView> {
         let mut v: Vec<&SessionView> = snap.iter().collect();
         if !self.show_inactive {
             // The watcher precomputes the live set off the render thread, so
@@ -267,10 +279,23 @@ impl App {
             match self.open_files.snapshot() {
                 RunningSnapshot::Tracked(open) => v.retain(|s| open.contains(&s.file)),
                 RunningSnapshot::Mtime(open) => {
-                    v.retain(|s| open.contains(&s.file) || is_active(s))
+                    v.retain(|s| open.contains(&s.file) || is_active(s, now))
                 }
             }
         }
+
+        // Live substring filter (case-insensitive). Matches project, model,
+        // short id, or full cwd. Applied after the running-only filter.
+        if !self.filter.is_empty() {
+            let f = self.filter.to_lowercase();
+            v.retain(|s| {
+                s.project_name().to_lowercase().contains(&f)
+                    || s.model.as_deref().unwrap_or("").to_lowercase().contains(&f)
+                    || s.short_id().to_lowercase().contains(&f)
+                    || s.cwd.as_deref().unwrap_or("").to_lowercase().contains(&f)
+            });
+        }
+
         sort_sessions(&mut v, self.sort, self.sort_reverse);
         v
     }
@@ -364,7 +389,10 @@ fn main_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, shared: Shared) 
             current(&app.shared)
         };
         let total = snap.len();
-        let sessions = app.view(&snap);
+        // Capture `now` once per tick: filtering, sorting, and rendering all
+        // read the same instant so nothing flips mid-frame.
+        let now = Utc::now();
+        let sessions = app.view(&snap, now);
         let hidden = total.saturating_sub(sessions.len());
         let display = build_display(&sessions, app.group, &app.collapsed);
 
@@ -383,7 +411,7 @@ fn main_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, shared: Shared) 
             .detail_id
             .as_deref()
             .and_then(|id| snap.iter().find(|s| s.id == id));
-        terminal.draw(|f| draw(f, &mut app, &sessions, &display, hidden, detail))?;
+        terminal.draw(|f| draw(f, &mut app, &sessions, &display, hidden, detail, now))?;
 
         if event::poll(TICK)? {
             if let Event::Key(k) = event::read()? {
@@ -407,8 +435,37 @@ fn main_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, shared: Shared) 
                     }
                     continue;
                 }
+
+                // Filter input mode: capture typing, backspace, and exit keys.
+                if app.input_mode == InputMode::Filtering {
+                    match k.code {
+                        KeyCode::Esc | KeyCode::Enter => {
+                            app.input_mode = InputMode::Normal;
+                        }
+                        KeyCode::Backspace => {
+                            app.filter.pop();
+                        }
+                        KeyCode::Char(c) => {
+                            // Ignore control chars that slip through.
+                            if !c.is_control() {
+                                app.filter.push(c);
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                // Normal mode key handling.
                 match k.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('q') | KeyCode::Esc => {
+                        if !app.filter.is_empty() {
+                            // Esc clears active filter instead of quitting.
+                            app.filter.clear();
+                        } else {
+                            break;
+                        }
+                    }
                     KeyCode::Char('?') => app.show_help = true,
                     KeyCode::Char(' ') => {
                         app.paused = !app.paused;
@@ -435,6 +492,9 @@ fn main_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, shared: Shared) 
                     KeyCode::Char('s') => app.set_sort(SortBy::Source),
                     KeyCode::Char('g') => app.group = !app.group,
                     KeyCode::Char('A') => app.show_inactive = !app.show_inactive,
+                    KeyCode::Char('/') => {
+                        app.input_mode = InputMode::Filtering;
+                    }
                     _ => {}
                 }
             }
@@ -450,22 +510,54 @@ fn draw(
     display: &[DisplayRow],
     hidden: usize,
     detail: Option<&SessionView>,
+    now: DateTime<Utc>,
 ) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
-        .split(f.area());
+    let show_filter_bar = app.input_mode == InputMode::Filtering || !app.filter.is_empty();
 
-    draw_header(f, chunks[0], sessions);
-    draw_table(f, chunks[1], app, display, sessions.len(), hidden);
-    draw_footer(f, chunks[2], app);
+    let chunks = if show_filter_bar {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(0),
+                Constraint::Length(1), // filter bar
+                Constraint::Length(1), // footer
+            ])
+            .split(f.area())
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
+            .split(f.area())
+    };
+
+    draw_header(f, chunks[0], sessions, now);
+    draw_table(
+        f,
+        chunks[1],
+        &mut app.state,
+        app.sort,
+        app.sort_reverse,
+        app.group,
+        display,
+        sessions.len(),
+        hidden,
+        now,
+    );
+
+    if show_filter_bar {
+        draw_filter_bar(f, chunks[2], app);
+        draw_footer(f, chunks[3], app);
+    } else {
+        draw_footer(f, chunks[2], app);
+    }
 
     if let Some(s) = detail {
-        draw_detail(f, s);
+        draw_detail(f, s, now);
     }
     if app.show_help {
         draw_help(f);
@@ -487,11 +579,11 @@ fn push_if_fits(
     }
 }
 
-fn draw_header(f: &mut ratatui::Frame, area: Rect, sessions: &[&SessionView]) {
+fn draw_header(f: &mut ratatui::Frame, area: Rect, sessions: &[&SessionView], now: DateTime<Utc>) {
     let avail = area.width.saturating_sub(2); // inside the border
     let total_tokens: u64 = sessions.iter().map(|s| s.tokens.total()).sum();
     let total_cost: f64 = sessions.iter().filter_map(|s| s.cost_usd).sum();
-    let active = sessions.iter().filter(|s| is_active(s)).count();
+    let active = sessions.iter().filter(|s| is_active(s, now)).count();
     let claude_n = sessions
         .iter()
         .filter(|s| s.kind == AgentKind::Claude)
@@ -578,13 +670,22 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, sessions: &[&SessionView]) {
     f.render_widget(p, area);
 }
 
+// The arguments here are all UI state the table renders against (sort key,
+// direction, group flag, hidden count) — bundling them into a struct would
+// just push the same fields through one level of indirection, so the lint is
+// silenced rather than refactored around.
+#[allow(clippy::too_many_arguments)]
 fn draw_table(
     f: &mut ratatui::Frame,
     area: Rect,
-    app: &mut App,
+    state: &mut TableState,
+    sort: SortBy,
+    sort_reverse: bool,
+    group: bool,
     display: &[DisplayRow],
     session_count: usize,
     hidden: usize,
+    now: DateTime<Utc>,
 ) {
     let cols = visible_columns(area.width.saturating_sub(2));
 
@@ -600,7 +701,7 @@ fn draw_table(
     let rows: Vec<Row> = display
         .iter()
         .map(|d| match d {
-            DisplayRow::Session(s) => Row::new(session_cells(s, &cols)),
+            DisplayRow::Session(s) => Row::new(session_cells(s, &cols, now)),
             DisplayRow::Group(g) => {
                 Row::new(group_cells(g, &cols)).style(Style::default().bg(Color::Rgb(30, 30, 46)))
             }
@@ -609,15 +710,15 @@ fn draw_table(
 
     let widths: Vec<Constraint> = cols.iter().map(|c| c.constraint()).collect();
 
-    let dir = if app.sort_reverse { "▲" } else { "▼" };
-    let grouped = if app.group { ", grouped" } else { "" };
+    let dir = if sort_reverse { "▲" } else { "▼" };
+    let grouped = if group { ", grouped" } else { "" };
     let title = if hidden > 0 {
         format!(
             " sessions ({} of {} — {} hidden, A) — sort: {} {}{} ",
             session_count,
             session_count + hidden,
             hidden,
-            sort_label(app.sort),
+            sort_label(sort),
             dir,
             grouped
         )
@@ -625,7 +726,7 @@ fn draw_table(
         format!(
             " sessions ({}) — sort: {} {}{} ",
             session_count,
-            sort_label(app.sort),
+            sort_label(sort),
             dir,
             grouped
         )
@@ -640,14 +741,14 @@ fn draw_table(
                 .add_modifier(Modifier::BOLD),
         );
 
-    f.render_stateful_widget(table, area, &mut app.state);
+    f.render_stateful_widget(table, area, state);
 }
 
-fn session_cells(s: &SessionView, cols: &[Col]) -> Vec<Cell<'static>> {
-    cols.iter().map(|c| session_cell(s, *c)).collect()
+fn session_cells(s: &SessionView, cols: &[Col], now: DateTime<Utc>) -> Vec<Cell<'static>> {
+    cols.iter().map(|c| session_cell(s, *c, now)).collect()
 }
 
-fn session_cell(s: &SessionView, col: Col) -> Cell<'static> {
+fn session_cell(s: &SessionView, col: Col, now: DateTime<Utc>) -> Cell<'static> {
     match col {
         Col::Src => {
             let c = match s.kind {
@@ -684,9 +785,9 @@ fn session_cell(s: &SessionView, col: Col) -> Cell<'static> {
             Some(_) => Cell::from("<$0.01").style(Style::default().fg(Color::DarkGray)),
             None => Cell::from("-").style(Style::default().fg(Color::DarkGray)),
         },
-        Col::Ago => Cell::from(format_ago(s)),
+        Col::Ago => Cell::from(format_ago(s, now)),
         Col::Status => {
-            let active = is_active(s);
+            let active = is_active(s, now);
             let text = if active { "● active" } else { "  idle" };
             let color = if active {
                 Color::Green
@@ -767,6 +868,36 @@ fn chip(label: &str) -> Span<'_> {
         format!(" {} ", label),
         Style::default().bg(Color::DarkGray).fg(Color::White),
     )
+}
+
+fn draw_filter_bar(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    let is_editing = app.input_mode == InputMode::Filtering;
+
+    let content = if is_editing {
+        // Active prompt while the user is typing the filter.
+        format!(" / {}", app.filter)
+    } else {
+        // Subtle indicator when a filter is active but we're back in normal mode.
+        format!(" filter: \"{}\"", app.filter)
+    };
+
+    let style = if is_editing {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let p = Paragraph::new(content).style(style);
+    f.render_widget(p, area);
+
+    if is_editing {
+        // Real terminal cursor right after the prompt + typed text.
+        // " / " is 3 characters.
+        let prompt_len: u16 = 3;
+        let cursor_x = area.x + prompt_len + app.filter.chars().count() as u16;
+        let cursor_y = area.y;
+        f.set_cursor_position(Position { x: cursor_x, y: cursor_y });
+    }
 }
 
 /// Green well below the limit, yellow approaching it, red near auto-compaction.
@@ -851,6 +982,11 @@ fn draw_help(f: &mut ratatui::Frame) {
         row("A", "show all vs. running only"),
         row("Space", "pause / resume the display"),
         row("?", "toggle this help"),
+        Line::from(""),
+        head("Filter"),
+        row("/", "start typing a live filter (project / model / id / path)"),
+        row("Esc / Enter", "exit filter mode (filter stays active)"),
+        row("Esc (normal)", "clear active filter"),
     ];
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -858,7 +994,7 @@ fn draw_help(f: &mut ratatui::Frame) {
 /// Modal detail overlay for one session: identity, token breakdown, cost,
 /// context-window gauge, and a sparkline of token activity over the retained
 /// window. Drawn on top of the table (which it dims via `Clear`).
-fn draw_detail(f: &mut ratatui::Frame, s: &SessionView) {
+fn draw_detail(f: &mut ratatui::Frame, s: &SessionView, now: DateTime<Utc>) {
     let area = centered_rect(72, 70, f.area());
     f.render_widget(Clear, area);
 
@@ -957,11 +1093,11 @@ fn draw_detail(f: &mut ratatui::Frame, s: &SessionView) {
         ]),
         Line::from(vec![
             label("started"),
-            Span::raw(format_local_with_ago(s.started_at, &dash)),
+            Span::raw(format_local_with_ago(s.started_at, now, &dash)),
         ]),
         Line::from(vec![
             label("last"),
-            Span::raw(format_local_with_ago(s.last_activity, &dash)),
+            Span::raw(format_local_with_ago(s.last_activity, now, &dash)),
         ]),
     ];
     f.render_widget(Paragraph::new(info), rows[0]);
@@ -977,29 +1113,29 @@ fn draw_detail(f: &mut ratatui::Frame, s: &SessionView) {
     f.render_widget(spark, rows[1]);
 }
 
-fn is_active(s: &SessionView) -> bool {
+fn is_active(s: &SessionView, now: DateTime<Utc>) -> bool {
     s.last_activity
-        .map(|t| (Utc::now() - t).num_seconds() <= ACTIVE_WINDOW_SECS)
+        .map(|t| (now - t).num_seconds() <= ACTIVE_WINDOW_SECS)
         .unwrap_or(false)
 }
 
-fn format_ago(s: &SessionView) -> String {
+fn format_ago(s: &SessionView, now: DateTime<Utc>) -> String {
     let Some(t) = s.last_activity else {
         return "-".into();
     };
-    format_ago_secs((Utc::now() - t).num_seconds())
+    format_ago_secs((now - t).num_seconds())
 }
 
 /// Render an absolute timestamp in the user's local timezone alongside the
 /// relative "X ago" delta — the detail overlay needs both: the delta tells you
 /// when something happened relative to now, the wall clock tells you when it
 /// happened in the day. Falls back to `dash` when the timestamp is unknown.
-fn format_local_with_ago(t: Option<DateTime<Utc>>, dash: &str) -> String {
+fn format_local_with_ago(t: Option<DateTime<Utc>>, now: DateTime<Utc>, dash: &str) -> String {
     let Some(t) = t else {
         return dash.to_string();
     };
     let local = t.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S");
-    let ago = format_ago_secs((Utc::now() - t).num_seconds());
+    let ago = format_ago_secs((now - t).num_seconds());
     format!("{local}  ({ago} ago)")
 }
 
@@ -1046,7 +1182,10 @@ fn sort_label(s: SortBy) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{AgentKind, Session};
+    use crate::model::{AgentKind, Session, SessionView, TokenStats, SPARK_BUCKETS};
+    use chrono::TimeZone;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
     use std::path::PathBuf;
 
     fn view_for(project: &str, out: u64) -> SessionView {
@@ -1054,6 +1193,89 @@ mod tests {
         s.cwd = Some(project.into());
         s.tokens.output = out;
         s.view()
+    }
+
+    /// Fixed wall clock used by every snapshot test. Anything time-dependent
+    /// (AGO column, STATUS, header `active` count, detail "last") is computed
+    /// against this — never `Utc::now()` — so the rendered buffers stay
+    /// byte-identical run to run.
+    fn fixed_now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap()
+    }
+
+    /// Build a fully-populated `SessionView` with deterministic fields so the
+    /// rendered cells (id, project, model, tokens, cost, ago, status, ctx) are
+    /// predictable. `ago_secs` shifts both `last_activity` and `started_at`
+    /// from `fixed_now`, so the AGO/STATUS columns can be steered per test.
+    fn make_view(
+        kind: AgentKind,
+        id: &str,
+        project: &str,
+        ago_secs: i64,
+        total_tokens: u64,
+        cost: f64,
+    ) -> SessionView {
+        let now = fixed_now();
+        // Split the requested total across input/output/cache so every counter
+        // column has something meaningful in it (otherwise CACHE renders 0).
+        let input = total_tokens / 4;
+        let output = total_tokens / 2;
+        let cache_read = total_tokens.saturating_sub(input + output);
+        let tokens = TokenStats {
+            input,
+            output,
+            cache_read,
+            cache_creation: 0,
+        };
+        SessionView {
+            kind,
+            id: id.to_string(),
+            file: PathBuf::from(format!("/tmp/{id}.jsonl")),
+            cwd: Some(project.to_string()),
+            model: Some("claude-opus-4-7".to_string()),
+            started_at: Some(now - chrono::Duration::seconds(ago_secs + 3600)),
+            last_activity: Some(now - chrono::Duration::seconds(ago_secs)),
+            tokens,
+            tokens_last_60s: 250,
+            cost_usd: Some(cost),
+            context_used: 50_000,
+            context_max: Some(200_000),
+            context_pct: Some(0.25),
+            turn_count: 7,
+            spark: vec![0; SPARK_BUCKETS],
+        }
+    }
+
+    /// Render via a [`TestBackend`] and return the buffer as text lines with
+    /// trailing whitespace stripped. Style (color/bold) is intentionally
+    /// ignored — these are layout/copy snapshots, not pixel diffs.
+    fn render_to_lines<F: FnOnce(&mut ratatui::Frame)>(
+        width: u16,
+        height: u16,
+        draw_fn: F,
+    ) -> Vec<String> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(draw_fn).unwrap();
+        buffer_to_lines(terminal.backend().buffer())
+    }
+
+    fn buffer_to_lines(buf: &Buffer) -> Vec<String> {
+        let area = buf.area;
+        (0..area.height)
+            .map(|y| {
+                let mut s = String::new();
+                for x in 0..area.width {
+                    let sym = buf
+                        .cell((x, y))
+                        .map(|c| c.symbol())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(" ");
+                    s.push_str(sym);
+                }
+                s.trim_end().to_string()
+            })
+            .collect()
     }
 
     #[test]
@@ -1070,12 +1292,13 @@ mod tests {
 
     #[test]
     fn format_local_with_ago_includes_clock_and_delta() {
+        let now = Utc::now();
         // None → dash.
-        assert_eq!(format_local_with_ago(None, "-"), "-");
+        assert_eq!(format_local_with_ago(None, now, "-"), "-");
         // 30s ago: rendered as "YYYY-MM-DD HH:MM:SS  (30s ago)" in local TZ.
-        let t = Utc::now() - chrono::Duration::seconds(30);
-        let s = format_local_with_ago(Some(t), "-");
-        assert!(s.contains("ago)"), "missing relative suffix: {s}");
+        let t = now - chrono::Duration::seconds(30);
+        let s = format_local_with_ago(Some(t), now, "-");
+        assert!(s.contains("(30s ago)"), "missing relative suffix: {s}");
         // The wall-clock portion ends with seconds, so the line should
         // contain two ':' characters (HH:MM:SS).
         assert!(s.matches(':').count() >= 2, "missing wall clock: {s}");
@@ -1123,6 +1346,323 @@ mod tests {
             .map(|c| CANONICAL.iter().position(|x| x == c).unwrap())
             .collect();
         assert!(positions.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    /// Compare two snapshot listings line-by-line, panicking with a unified
+    /// diff that's easy to copy into the expected value when something drifts.
+    /// Keeps every snapshot test failure self-explanatory in the test output.
+    #[track_caller]
+    fn assert_lines_eq(actual: &[String], expected: &[&str]) {
+        if actual.len() != expected.len()
+            || actual.iter().zip(expected).any(|(a, b)| a != b)
+        {
+            let mut msg = String::from("snapshot mismatch\n");
+            let n = actual.len().max(expected.len());
+            for i in 0..n {
+                let a = actual.get(i).map(String::as_str).unwrap_or("<missing>");
+                let e = expected.get(i).copied().unwrap_or("<missing>");
+                let tag = if a == e { " " } else { "*" };
+                msg.push_str(&format!("{tag}{i:>3} expected: |{e}|\n"));
+                msg.push_str(&format!("{tag}    actual:   |{a}|\n"));
+            }
+            panic!("{msg}");
+        }
+    }
+
+    /// Snapshot: full header band at 100×3. Pinned so any change to the
+    /// header copy/order is a deliberate, reviewable test update.
+    #[test]
+    fn snapshot_header_shows_title_counts_cost_and_breakdown() {
+        let s = make_view(AgentKind::Claude, "abc12345", "/w/alpha", 10, 4_000, 1.25);
+        let views = vec![&s];
+
+        let lines = render_to_lines(100, 3, |f| {
+            draw_header(f, f.area(), &views, fixed_now());
+        });
+        let expected = [
+            "┌──────────────────────────────────────────────────────────────────────────────────────────────────┐",
+            "│agtop   sessions: 1  active: 1   $1.25   tokens: 4.0k   250 tok/60s   claude:1  codex:0           │",
+            "└──────────────────────────────────────────────────────────────────────────────────────────────────┘",
+        ];
+        assert_lines_eq(&lines, &expected);
+    }
+
+    /// Snapshot: full session table at 120×8. Covers column ordering, header
+    /// row, both AgentKind variants, the active/idle decoration, and the cost
+    /// formatting. CACHE/IN/OUT are intentionally not in scope at this width —
+    /// `snapshot_table_narrow_drops_columns` exercises the elision path.
+    #[test]
+    fn snapshot_table_renders_two_sessions() {
+        let s1 = make_view(AgentKind::Claude, "abc12345", "/w/alpha", 10, 4_000, 1.25);
+        let s2 = make_view(AgentKind::Codex, "def67890", "/w/beta", 600, 12_000, 0.40);
+        let refs = vec![&s1, &s2];
+        let display = build_display(&refs, false, &HashSet::new());
+        let mut state = TableState::default();
+        state.select(Some(0));
+
+        let lines = render_to_lines(120, 8, |f| {
+            draw_table(
+                f,
+                f.area(),
+                &mut state,
+                SortBy::LastActivity,
+                false,
+                false,
+                &display,
+                refs.len(),
+                0,
+                fixed_now(),
+            );
+        });
+        let expected = [
+            "┌ sessions (2) — sort: activity ▼ ─────────────────────────────────────────────────────────────────────────────────────┐",
+            "│SRC     ID         PROJECT                MODEL              TOTAL      CTX   TOK/60S   $        AGO     STATUS       │",
+            "│claude  abc12345   alpha                  claude-opus-4-7    4.0k       25%   250       $1.25    10s     ● active     │",
+            "│codex   def67890   beta                   claude-opus-4-7    12.0k      25%   250       $0.40    10m       idle       │",
+            "│                                                                                                                      │",
+            "│                                                                                                                      │",
+            "│                                                                                                                      │",
+            "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘",
+        ];
+        assert_lines_eq(&lines, &expected);
+    }
+
+    /// Snapshot: narrow terminal (70 cols). Confirms the column-elision
+    /// pipeline keeps only the essential identity/cost columns visible and
+    /// drops MODEL/ID/CTX/RATE/CACHE/IN/OUT in priority order.
+    #[test]
+    fn snapshot_table_narrow_drops_columns() {
+        let s1 = make_view(AgentKind::Claude, "abc12345", "/w/alpha", 10, 4_000, 1.25);
+        let s2 = make_view(AgentKind::Codex, "def67890", "/w/beta", 600, 12_000, 0.40);
+        let refs = vec![&s1, &s2];
+        let display = build_display(&refs, false, &HashSet::new());
+        let mut state = TableState::default();
+        state.select(Some(0));
+
+        let lines = render_to_lines(70, 8, |f| {
+            draw_table(
+                f,
+                f.area(),
+                &mut state,
+                SortBy::LastActivity,
+                false,
+                false,
+                &display,
+                refs.len(),
+                0,
+                fixed_now(),
+            );
+        });
+        let expected = [
+            "┌ sessions (2) — sort: activity ▼ ───────────────────────────────────┐",
+            "│SRC     PROJECT                TOTAL      $        AGO     STATUS   │",
+            "│claude  alpha                  4.0k       $1.25    10s     ● active │",
+            "│codex   beta                   12.0k      $0.40    10m       idle   │",
+            "│                                                                    │",
+            "│                                                                    │",
+            "│                                                                    │",
+            "└────────────────────────────────────────────────────────────────────┘",
+        ];
+        assert_lines_eq(&lines, &expected);
+    }
+
+    /// Snapshot: grouped (tree) view. Subtotal rows appear above each project
+    /// with the count, summed tokens, and summed cost; sessions follow under
+    /// their group. The active/idle column survives unchanged.
+    #[test]
+    fn snapshot_table_grouped_shows_subtotals() {
+        let s1 = make_view(AgentKind::Claude, "abc12345", "/w/alpha", 10, 4_000, 1.25);
+        let s2 = make_view(AgentKind::Codex, "def67890", "/w/beta", 600, 12_000, 0.40);
+        let s3 = make_view(AgentKind::Claude, "extra123", "/w/alpha", 30, 2_000, 0.10);
+        let refs = vec![&s1, &s3, &s2];
+        let display = build_display(&refs, true, &HashSet::new());
+        let mut state = TableState::default();
+        state.select(Some(0));
+
+        let lines = render_to_lines(120, 10, |f| {
+            draw_table(
+                f,
+                f.area(),
+                &mut state,
+                SortBy::LastActivity,
+                false,
+                true,
+                &display,
+                refs.len(),
+                0,
+                fixed_now(),
+            );
+        });
+        let expected = [
+            "┌ sessions (3) — sort: activity ▼, grouped ────────────────────────────────────────────────────────────────────────────┐",
+            "│SRC     ID         PROJECT                MODEL              TOTAL      CTX   TOK/60S   $        AGO     STATUS       │",
+            "│▾                  alpha (2)                                 6.0k                       $1.35                         │",
+            "│claude  abc12345   alpha                  claude-opus-4-7    4.0k       25%   250       $1.25    10s     ● active     │",
+            "│claude  extra123   alpha                  claude-opus-4-7    2.0k       25%   250       $0.10    30s     ● active     │",
+            "│▾                  beta (1)                                  12.0k                      $0.40                         │",
+            "│codex   def67890   beta                   claude-opus-4-7    12.0k      25%   250       $0.40    10m       idle       │",
+            "│                                                                                                                      │",
+            "│                                                                                                                      │",
+            "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘",
+        ];
+        assert_lines_eq(&lines, &expected);
+    }
+
+    /// Snapshot: collapsed group hides its children — the alpha row should
+    /// stay (with a `▸` chevron) but its two sessions vanish, while beta and
+    /// its one session remain visible.
+    #[test]
+    fn snapshot_table_collapsed_group_hides_children() {
+        let s1 = make_view(AgentKind::Claude, "abc12345", "/w/alpha", 10, 4_000, 1.25);
+        let s2 = make_view(AgentKind::Codex, "def67890", "/w/beta", 600, 12_000, 0.40);
+        let s3 = make_view(AgentKind::Claude, "extra123", "/w/alpha", 30, 2_000, 0.10);
+        let refs = vec![&s1, &s3, &s2];
+        let mut collapsed = HashSet::new();
+        collapsed.insert("alpha".to_string());
+        let display = build_display(&refs, true, &collapsed);
+        let mut state = TableState::default();
+        state.select(Some(0));
+
+        let lines = render_to_lines(120, 8, |f| {
+            draw_table(
+                f,
+                f.area(),
+                &mut state,
+                SortBy::LastActivity,
+                false,
+                true,
+                &display,
+                refs.len(),
+                0,
+                fixed_now(),
+            );
+        });
+        // The first content row's chevron switches from ▾ to ▸ and alpha's
+        // two child sessions are absent.
+        assert!(
+            lines[2].contains("▸                  alpha (2)"),
+            "expected collapsed chevron, got: {}",
+            lines[2]
+        );
+        assert!(
+            lines[3].contains("▾                  beta (1)"),
+            "expected next row to be beta header, got: {}",
+            lines[3]
+        );
+        assert!(
+            lines.iter().all(|l| !l.contains("abc12345")),
+            "alpha child session should be hidden"
+        );
+    }
+
+    /// Snapshot: detail overlay at 80×28. Pinned so model/project/path/context
+    /// rows, the per-bucket token rows, turns/cost/tok-rate, and the
+    /// `tokens · last 5m` sparkline-block title don't silently drift.
+    #[test]
+    fn snapshot_detail_overlay_renders_session_fields() {
+        let s = make_view(AgentKind::Claude, "abc12345", "/w/alpha", 10, 4_000, 1.25);
+        let lines = render_to_lines(80, 28, |f| draw_detail(f, &s, fixed_now()));
+        let expected = [
+            "",
+            "",
+            "",
+            "",
+            "           ┌ claude · abc12345 ─────────────────────────────────────┐",
+            "           │model    claude-opus-4-7                                │",
+            "           │project  alpha                                          │",
+            "           │path     /tmp/abc12345.jsonl                            │",
+            "           │                                                        │",
+            "           │context  50.0k / 200.0k  (25%)                          │",
+            "           │                                                        │",
+            "           │input    1.0k                                           │",
+            "           │output   2.0k                                           │",
+            "           │cache r  1.0k                                           │",
+            "           │cache w  0                                              │",
+            "           │total    4.0k                                           │",
+            "           │turns    7                                              │",
+            "           │cost     $1.2500                                        │",
+            "           │tok/60s  250                                            │",
+            "           │ tokens · last 5m (peak 0) ─────────────────────────────│",
+            "           │                                                        │",
+            "           │                                                        │",
+            "           │                                                        │",
+            "           └────────────────────────────────────────────────────────┘",
+            "",
+            "",
+            "",
+            "",
+        ];
+        assert_lines_eq(&lines, &expected);
+    }
+
+    /// Snapshot: help overlay at 60×26. The Navigation/Sort/View sections,
+    /// every documented key, and the box-drawing borders are pinned so a
+    /// stray edit to the help copy or layout shows up immediately.
+    #[test]
+    fn snapshot_help_overlay_lists_keybindings() {
+        let lines = render_to_lines(60, 26, draw_help);
+        let expected = [
+            "",
+            "",
+            "",
+            "             ┌ help ──────────────────────────┐",
+            "             │Navigation                      │",
+            "             │  ↑/k ↓/j   move selection      │",
+            "             │  Enter     open detail · collap│",
+            "             │  q / Esc   quit                │",
+            "             │                                │",
+            "             │Sort  (press again to reverse)  │",
+            "             │  t         total tokens        │",
+            "             │  c         cost ($)            │",
+            "             │  m         rate (tok/60s)      │",
+            "             │  a         last activity       │",
+            "             │  p         project             │",
+            "             │  s         source              │",
+            "             │                                │",
+            "             │View                            │",
+            "             │  g         group by project (tr│",
+            "             │  A         show all vs. running│",
+            "             │  Space     pause / resume the d│",
+            "             │  ?         toggle this help    │",
+            "             └────────────────────────────────┘",
+            "",
+            "",
+            "",
+        ];
+        assert_lines_eq(&lines, &expected);
+    }
+
+    /// Snapshot: the `hidden` count appears in the table title when the
+    /// filter is hiding rows. Confirms the alternate title branch and that
+    /// the `A` hint stays attached so users know how to surface them.
+    #[test]
+    fn snapshot_table_title_shows_hidden_count() {
+        let s1 = make_view(AgentKind::Claude, "abc12345", "/w/alpha", 10, 4_000, 1.25);
+        let refs = vec![&s1];
+        let display = build_display(&refs, false, &HashSet::new());
+        let mut state = TableState::default();
+        state.select(Some(0));
+
+        let lines = render_to_lines(120, 4, |f| {
+            draw_table(
+                f,
+                f.area(),
+                &mut state,
+                SortBy::LastActivity,
+                false,
+                false,
+                &display,
+                refs.len(),
+                3, // 3 sessions hidden by the inactive filter
+                fixed_now(),
+            );
+        });
+        assert!(
+            lines[0]
+                .contains("sessions (1 of 4 — 3 hidden, A) — sort: activity ▼"),
+            "title missing hidden hint: {}",
+            lines[0]
+        );
     }
 
     #[test]
