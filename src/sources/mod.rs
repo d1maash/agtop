@@ -184,6 +184,151 @@ mod tests {
         assert!(!passes_cutoff(p, Some(cutoff)));
     }
 
+    /// A jsonl path under the user's claude root that classify() will pick up,
+    /// scoped to this process so parallel test runs don't collide. The file
+    /// itself isn't created here — callers write it.
+    fn temp_claude_jsonl(tag: &str) -> PathBuf {
+        let root = claude_root().expect("claude_root resolvable");
+        let dir = root.join(format!("-agtop-test-{}-{}", std::process::id(), tag));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("session.jsonl")
+    }
+
+    fn append(path: &Path, bytes: &[u8]) {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        f.write_all(bytes).unwrap();
+    }
+
+    /// First tail seeds the offset and parses the line; a second tail with no
+    /// new bytes is a no-op (`Ok(false)`, offset unchanged); appending another
+    /// complete line advances the offset and accumulates into the existing
+    /// session — i.e. the parser doesn't re-read the bytes it already consumed.
+    #[test]
+    fn tail_is_incremental_across_writes() {
+        let path = temp_claude_jsonl("incremental");
+        let _g = scopeguard(&path);
+
+        // First line.
+        let l1 = br#"{"type":"assistant","sessionId":"s1","cwd":"/w/proj","message":{"model":"claude-opus-4-7","usage":{"input_tokens":10,"output_tokens":5}}}
+"#;
+        append(&path, l1);
+        let kind = classify(&path).expect("classify");
+        let mut sess = crate::model::Session::new(kind, path.clone());
+
+        let changed = tail(&mut sess, false).unwrap();
+        assert!(changed, "first tail should report progress");
+        assert_eq!(sess.file_offset, l1.len() as u64);
+        assert_eq!(sess.tokens.input, 10);
+        assert_eq!(sess.tokens.output, 5);
+        assert_eq!(sess.turn_count, 1);
+
+        // No new bytes → fast path returns false without parsing again.
+        let unchanged = tail(&mut sess, false).unwrap();
+        assert!(!unchanged, "second tail without new bytes should be a no-op");
+        assert_eq!(sess.tokens.input, 10);
+        assert_eq!(sess.turn_count, 1);
+
+        // Append another line. Offset should advance to total file length and
+        // tokens should accumulate, proving the parser skipped the old bytes.
+        let l2 = br#"{"type":"assistant","message":{"usage":{"input_tokens":3,"output_tokens":7}}}
+"#;
+        append(&path, l2);
+        let changed2 = tail(&mut sess, false).unwrap();
+        assert!(changed2);
+        assert_eq!(sess.file_offset, (l1.len() + l2.len()) as u64);
+        assert_eq!(sess.tokens.input, 13);
+        assert_eq!(sess.tokens.output, 12);
+        assert_eq!(sess.turn_count, 2);
+    }
+
+    /// Bytes without a trailing newline are not yet a complete line: tail
+    /// leaves the offset at the last complete-line boundary and the next tail
+    /// (after the newline lands) picks them up exactly once.
+    #[test]
+    fn tail_holds_partial_trailing_line_until_newline() {
+        let path = temp_claude_jsonl("partial");
+        let _g = scopeguard(&path);
+
+        // Complete line plus a partial fragment (no trailing newline).
+        let complete = br#"{"type":"assistant","message":{"usage":{"input_tokens":1,"output_tokens":1}}}
+"#;
+        let partial = br#"{"type":"assistant","message":{"usage":{"in"#;
+        append(&path, complete);
+        append(&path, partial);
+
+        let mut sess = crate::model::Session::new(classify(&path).unwrap(), path.clone());
+        let changed = tail(&mut sess, false).unwrap();
+        assert!(changed);
+        // Offset stops at the end of the complete line — the dangling bytes
+        // stay on disk to be re-read once their newline arrives.
+        assert_eq!(sess.file_offset, complete.len() as u64);
+        assert_eq!(sess.turn_count, 1);
+
+        // Now finish the partial line.
+        let rest = br#"put_tokens":4,"output_tokens":2}}}
+"#;
+        append(&path, rest);
+        let changed2 = tail(&mut sess, false).unwrap();
+        assert!(changed2);
+        assert_eq!(
+            sess.file_offset,
+            (complete.len() + partial.len() + rest.len()) as u64
+        );
+        assert_eq!(sess.tokens.input, 1 + 4);
+        assert_eq!(sess.tokens.output, 1 + 2);
+        assert_eq!(sess.turn_count, 2);
+    }
+
+    /// Truncation (file shrinks below the cached offset) resets the offset to
+    /// zero so the next tail re-reads the file from the start. This is the
+    /// recovery path for log rotation that reuses the same filename.
+    #[test]
+    fn tail_resets_offset_when_file_shrinks() {
+        let path = temp_claude_jsonl("shrink");
+        let _g = scopeguard(&path);
+
+        let l1 = br#"{"type":"assistant","message":{"usage":{"input_tokens":50,"output_tokens":50}}}
+"#;
+        append(&path, l1);
+        let mut sess = crate::model::Session::new(classify(&path).unwrap(), path.clone());
+        tail(&mut sess, false).unwrap();
+        assert_eq!(sess.file_offset, l1.len() as u64);
+
+        // Replace the file with a shorter content (simulating rotation/truncate).
+        let l2 = br#"{"type":"assistant","message":{"usage":{"input_tokens":1,"output_tokens":2}}}
+"#;
+        std::fs::write(&path, l2).unwrap();
+
+        let changed = tail(&mut sess, false).unwrap();
+        assert!(changed, "tail should re-read after truncate");
+        assert_eq!(sess.file_offset, l2.len() as u64);
+        // The post-truncate read is added on top of the pre-truncate totals;
+        // what matters here is that the offset reset and the new line was
+        // parsed (not skipped because `offset > len`).
+        assert_eq!(sess.tokens.input, 50 + 1);
+        assert_eq!(sess.tokens.output, 50 + 2);
+    }
+
+    /// Cleanup helper: removes both the file and its synthetic parent dir
+    /// when the test scope ends, even on panic.
+    fn scopeguard(path: &Path) -> impl Drop {
+        struct Guard(PathBuf);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+                if let Some(parent) = self.0.parent() {
+                    let _ = std::fs::remove_dir(parent);
+                }
+            }
+        }
+        Guard(path.to_path_buf())
+    }
+
     #[test]
     fn passes_cutoff_fresh_file_passes_and_old_does_not() {
         let dir = std::env::temp_dir();
