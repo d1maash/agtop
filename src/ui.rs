@@ -1,3 +1,6 @@
+use crate::alerts::{
+    self, AlertConfig, AlertState, ROW_DANGER_CONTEXT, ROW_WARN_CONTEXT,
+};
 use crate::model::{AgentKind, SessionView};
 use crate::processes::RunningSnapshot;
 use crate::watcher::{current, Shared, Snapshot};
@@ -22,9 +25,9 @@ use std::time::Duration;
 const TICK: Duration = Duration::from_millis(250);
 const ACTIVE_WINDOW_SECS: i64 = 120;
 
-pub fn run(shared: Shared) -> Result<()> {
+pub fn run(shared: Shared, alerts: AlertConfig) -> Result<()> {
     let mut terminal = setup()?;
-    let res = main_loop(&mut terminal, shared);
+    let res = main_loop(&mut terminal, shared, alerts);
     teardown(&mut terminal)?;
     res
 }
@@ -227,10 +230,14 @@ struct App {
     input_mode: InputMode,
     /// Active substring filter (case-insensitive). Empty means no filter.
     filter: String,
+    /// Threshold + notification configuration from CLI flags.
+    alerts: AlertConfig,
+    /// Rising-edge tracker for the alert dispatch loop.
+    alert_state: AlertState,
 }
 
 impl App {
-    fn new(shared: Shared) -> Self {
+    fn new(shared: Shared, alerts: AlertConfig) -> Self {
         let mut state = TableState::default();
         state.select(Some(0));
         Self {
@@ -248,6 +255,8 @@ impl App {
             collapsed: HashSet::new(),
             input_mode: InputMode::Normal,
             filter: String::new(),
+            alerts,
+            alert_state: AlertState::default(),
         }
     }
 
@@ -378,8 +387,12 @@ fn sort_sessions(sessions: &mut [&SessionView], by: SortBy, reverse: bool) {
     }
 }
 
-fn main_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, shared: Shared) -> Result<()> {
-    let mut app = App::new(shared);
+fn main_loop(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    shared: Shared,
+    alerts: AlertConfig,
+) -> Result<()> {
+    let mut app = App::new(shared, alerts);
 
     loop {
         // While paused, keep showing the frozen snapshot instead of the latest.
@@ -411,7 +424,37 @@ fn main_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, shared: Shared) 
             .detail_id
             .as_deref()
             .and_then(|id| snap.iter().find(|s| s.id == id));
-        terminal.draw(|f| draw(f, &mut app, &sessions, &display, hidden, detail, now))?;
+
+        // Alert dispatch runs against the live, unfiltered snapshot so a hidden
+        // session can still trigger a notification — the user wants to know
+        // even if they're focused elsewhere. Pause silences alerts to match the
+        // "freeze the display" intent.
+        if !app.paused && !app.alerts.is_quiet() {
+            let total_cost: f64 = snap.iter().filter_map(|s| s.cost_usd).sum();
+            let fired = app.alert_state.check(&app.alerts, &snap, total_cost);
+            for a in &fired {
+                if app.alerts.bell {
+                    alerts::ring_bell();
+                }
+                if app.alerts.desktop {
+                    alerts::dispatch_desktop(a);
+                }
+            }
+        }
+
+        // Budget vs. *displayed* total drives the header color. The dispatch
+        // above uses the unfiltered total; the visual cue tracks what the user
+        // is actually looking at, which is intuitive when filters are active.
+        let displayed_cost: f64 = sessions.iter().filter_map(|s| s.cost_usd).sum();
+        let over_budget = app
+            .alerts
+            .budget
+            .map(|b| displayed_cost > b)
+            .unwrap_or(false);
+
+        terminal.draw(|f| {
+            draw(f, &mut app, &sessions, &display, hidden, detail, now, over_budget)
+        })?;
 
         if event::poll(TICK)? {
             if let Event::Key(k) = event::read()? {
