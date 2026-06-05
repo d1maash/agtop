@@ -546,6 +546,7 @@ fn main_loop(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw(
     f: &mut ratatui::Frame,
     app: &mut App,
@@ -554,6 +555,7 @@ fn draw(
     hidden: usize,
     detail: Option<&SessionView>,
     now: DateTime<Utc>,
+    over_budget: bool,
 ) {
     let show_filter_bar = app.input_mode == InputMode::Filtering || !app.filter.is_empty();
 
@@ -578,7 +580,7 @@ fn draw(
             .split(f.area())
     };
 
-    draw_header(f, chunks[0], sessions, now);
+    draw_header(f, chunks[0], sessions, now, app.alerts.budget, over_budget);
     draw_table(
         f,
         chunks[1],
@@ -622,7 +624,14 @@ fn push_if_fits(
     }
 }
 
-fn draw_header(f: &mut ratatui::Frame, area: Rect, sessions: &[&SessionView], now: DateTime<Utc>) {
+fn draw_header(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    sessions: &[&SessionView],
+    now: DateTime<Utc>,
+    budget: Option<f64>,
+    over_budget: bool,
+) {
     let avail = area.width.saturating_sub(2); // inside the border
     let total_tokens: u64 = sessions.iter().map(|s| s.tokens.total()).sum();
     let total_cost: f64 = sessions.iter().filter_map(|s| s.cost_usd).sum();
@@ -664,16 +673,26 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, sessions: &[&SessionView], no
         )),
         true,
     );
+    // When over budget the total swaps from green → bold red and we append
+    // `/budget` so the user sees both the actual and the ceiling at a glance.
+    let cost_text = match budget {
+        Some(b) => format!("   ${:.2}/${:.0}", total_cost, b),
+        None => format!("   ${:.2}", total_cost),
+    };
+    let cost_style = if over_budget {
+        Style::default()
+            .fg(Color::Red)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::LightGreen)
+            .add_modifier(Modifier::BOLD)
+    };
     push_if_fits(
         &mut spans,
         &mut used,
         avail,
-        Span::styled(
-            format!("   ${:.2}", total_cost),
-            Style::default()
-                .fg(Color::LightGreen)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(cost_text, cost_style),
         false,
     );
     push_if_fits(
