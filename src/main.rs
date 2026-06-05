@@ -1,3 +1,4 @@
+mod alerts;
 mod model;
 mod pricing;
 mod processes;
@@ -37,6 +38,20 @@ struct Cli {
     /// machines with thousands of historical sessions.
     #[arg(long)]
     all: bool,
+    /// Comma-separated alert thresholds. Each entry is `NAME>VALUE` with NAME
+    /// being `context` (fraction 0..1) or `cost` (USD). Example:
+    /// `--notify-on=context>0.9,cost>50`. Fires a desktop notification (macOS
+    /// `osascript`, Linux `notify-send`) once per rising-edge crossing.
+    #[arg(long, value_name = "SPEC", default_value = "")]
+    notify_on: String,
+    /// Daily cost ceiling in USD. The header `$` total turns red when it goes
+    /// above this, and one notification fires per crossing (pair with
+    /// `--scan-since=24h` for a real daily window).
+    #[arg(long, value_name = "USD")]
+    budget: Option<f64>,
+    /// Ring the terminal bell (`\\x07`) when an alert fires.
+    #[arg(long)]
+    bell: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -165,9 +180,19 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
+    let triggers = alerts::parse_notify_on(&cli.notify_on)?;
+    let alert_cfg = alerts::AlertConfig {
+        // `--notify-on` implies desktop notifications; the user only typed
+        // thresholds, no separate opt-in needed. `--bell` is independent so
+        // bell-only setups work without `--notify-on`.
+        desktop: !triggers.is_empty(),
+        triggers,
+        budget: cli.budget,
+        bell: cli.bell,
+    };
     let (shared, map) = watcher::build_initial_state(cutoff);
     watcher::spawn(shared.clone(), map, cutoff)?;
-    ui::run(shared)
+    ui::run(shared, alert_cfg)
 }
 
 /// Translate `--all` / `--scan-since` into the optional UTC cutoff that the
