@@ -132,9 +132,7 @@ pub fn initial_scan() -> Result<HashMap<PathBuf, Session>> {
 /// watcher only when they become active (a notify event fires for them). The
 /// safety-scan applies the same cutoff so it doesn't undo this filtering 15s
 /// later. Pass `None` for a full scan (behaviour identical to `initial_scan`).
-pub fn initial_scan_since(
-    cutoff: Option<DateTime<Utc>>,
-) -> Result<HashMap<PathBuf, Session>> {
+pub fn initial_scan_since(cutoff: Option<DateTime<Utc>>) -> Result<HashMap<PathBuf, Session>> {
     let map: HashMap<PathBuf, Session> = list_files()
         .into_par_iter()
         .filter(|(_, p)| passes_cutoff(p, cutoff))
@@ -229,7 +227,10 @@ mod tests {
 
         // No new bytes → fast path returns false without parsing again.
         let unchanged = tail(&mut sess, false).unwrap();
-        assert!(!unchanged, "second tail without new bytes should be a no-op");
+        assert!(
+            !unchanged,
+            "second tail without new bytes should be a no-op"
+        );
         assert_eq!(sess.tokens.input, 10);
         assert_eq!(sess.turn_count, 1);
 
@@ -255,7 +256,8 @@ mod tests {
         let _g = scopeguard(&path);
 
         // Complete line plus a partial fragment (no trailing newline).
-        let complete = br#"{"type":"assistant","message":{"usage":{"input_tokens":1,"output_tokens":1}}}
+        let complete =
+            br#"{"type":"assistant","message":{"usage":{"input_tokens":1,"output_tokens":1}}}
 "#;
         let partial = br#"{"type":"assistant","message":{"usage":{"in"#;
         append(&path, complete);
@@ -292,7 +294,8 @@ mod tests {
         let path = temp_claude_jsonl("shrink");
         let _g = scopeguard(&path);
 
-        let l1 = br#"{"type":"assistant","message":{"usage":{"input_tokens":50,"output_tokens":50}}}
+        let l1 =
+            br#"{"type":"assistant","message":{"usage":{"input_tokens":50,"output_tokens":50}}}
 "#;
         append(&path, l1);
         let mut sess = crate::model::Session::new(classify(&path).unwrap(), path.clone());

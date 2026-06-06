@@ -1,6 +1,4 @@
-use crate::alerts::{
-    self, AlertConfig, AlertState, ROW_DANGER_CONTEXT, ROW_WARN_CONTEXT,
-};
+use crate::alerts::{self, AlertConfig, AlertState, ROW_DANGER_CONTEXT, ROW_WARN_CONTEXT};
 use crate::model::{AgentKind, SessionView};
 use crate::processes::RunningSnapshot;
 use crate::watcher::{current, Shared, Snapshot};
@@ -453,7 +451,16 @@ fn main_loop(
             .unwrap_or(false);
 
         terminal.draw(|f| {
-            draw(f, &mut app, &sessions, &display, hidden, detail, now, over_budget)
+            draw(
+                f,
+                &mut app,
+                &sessions,
+                &display,
+                hidden,
+                detail,
+                now,
+                over_budget,
+            )
         })?;
 
         if event::poll(TICK)? {
@@ -546,6 +553,7 @@ fn main_loop(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw(
     f: &mut ratatui::Frame,
     app: &mut App,
@@ -554,6 +562,7 @@ fn draw(
     hidden: usize,
     detail: Option<&SessionView>,
     now: DateTime<Utc>,
+    over_budget: bool,
 ) {
     let show_filter_bar = app.input_mode == InputMode::Filtering || !app.filter.is_empty();
 
@@ -578,7 +587,7 @@ fn draw(
             .split(f.area())
     };
 
-    draw_header(f, chunks[0], sessions, now);
+    draw_header(f, chunks[0], sessions, now, app.alerts.budget, over_budget);
     draw_table(
         f,
         chunks[1],
@@ -622,7 +631,14 @@ fn push_if_fits(
     }
 }
 
-fn draw_header(f: &mut ratatui::Frame, area: Rect, sessions: &[&SessionView], now: DateTime<Utc>) {
+fn draw_header(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    sessions: &[&SessionView],
+    now: DateTime<Utc>,
+    budget: Option<f64>,
+    over_budget: bool,
+) {
     let avail = area.width.saturating_sub(2); // inside the border
     let total_tokens: u64 = sessions.iter().map(|s| s.tokens.total()).sum();
     let total_cost: f64 = sessions.iter().filter_map(|s| s.cost_usd).sum();
@@ -664,16 +680,24 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, sessions: &[&SessionView], no
         )),
         true,
     );
+    // When over budget the total swaps from green → bold red and we append
+    // `/budget` so the user sees both the actual and the ceiling at a glance.
+    let cost_text = match budget {
+        Some(b) => format!("   ${:.2}/${:.0}", total_cost, b),
+        None => format!("   ${:.2}", total_cost),
+    };
+    let cost_style = if over_budget {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::LightGreen)
+            .add_modifier(Modifier::BOLD)
+    };
     push_if_fits(
         &mut spans,
         &mut used,
         avail,
-        Span::styled(
-            format!("   ${:.2}", total_cost),
-            Style::default()
-                .fg(Color::LightGreen)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(cost_text, cost_style),
         false,
     );
     push_if_fits(
@@ -744,7 +768,10 @@ fn draw_table(
     let rows: Vec<Row> = display
         .iter()
         .map(|d| match d {
-            DisplayRow::Session(s) => Row::new(session_cells(s, &cols, now)),
+            DisplayRow::Session(s) => match row_warn_style(s) {
+                Some(st) => Row::new(session_cells(s, &cols, now)).style(st),
+                None => Row::new(session_cells(s, &cols, now)),
+            },
             DisplayRow::Group(g) => {
                 Row::new(group_cells(g, &cols)).style(Style::default().bg(Color::Rgb(30, 30, 46)))
             }
@@ -903,6 +930,12 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ));
     }
+    if !app.alerts.is_quiet() {
+        spans.push(Span::styled(
+            "  [alerts]",
+            Style::default().fg(Color::Yellow),
+        ));
+    }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -939,7 +972,10 @@ fn draw_filter_bar(f: &mut ratatui::Frame, area: Rect, app: &App) {
         let prompt_len: u16 = 3;
         let cursor_x = area.x + prompt_len + app.filter.chars().count() as u16;
         let cursor_y = area.y;
-        f.set_cursor_position(Position { x: cursor_x, y: cursor_y });
+        f.set_cursor_position(Position {
+            x: cursor_x,
+            y: cursor_y,
+        });
     }
 }
 
@@ -951,6 +987,20 @@ fn context_color(pct: f64) -> Color {
         Color::Yellow
     } else {
         Color::Green
+    }
+}
+
+/// Subtle row background when a session is approaching the context limit. Two
+/// tiers so 80–90% looks "watch this" and ≥90% looks "act now"; both are dim
+/// enough that the cursor's blue highlight (applied on top) still reads.
+fn row_warn_style(s: &SessionView) -> Option<Style> {
+    let p = s.context_pct?;
+    if p >= ROW_DANGER_CONTEXT {
+        Some(Style::default().bg(Color::Rgb(60, 18, 18)))
+    } else if p >= ROW_WARN_CONTEXT {
+        Some(Style::default().bg(Color::Rgb(56, 38, 18)))
+    } else {
+        None
     }
 }
 
@@ -1027,7 +1077,10 @@ fn draw_help(f: &mut ratatui::Frame) {
         row("?", "toggle this help"),
         Line::from(""),
         head("Filter"),
-        row("/", "start typing a live filter (project / model / id / path)"),
+        row(
+            "/",
+            "start typing a live filter (project / model / id / path)",
+        ),
         row("Esc / Enter", "exit filter mode (filter stays active)"),
         row("Esc (normal)", "clear active filter"),
     ];
@@ -1396,9 +1449,7 @@ mod tests {
     /// Keeps every snapshot test failure self-explanatory in the test output.
     #[track_caller]
     fn assert_lines_eq(actual: &[String], expected: &[&str]) {
-        if actual.len() != expected.len()
-            || actual.iter().zip(expected).any(|(a, b)| a != b)
-        {
+        if actual.len() != expected.len() || actual.iter().zip(expected).any(|(a, b)| a != b) {
             let mut msg = String::from("snapshot mismatch\n");
             let n = actual.len().max(expected.len());
             for i in 0..n {
@@ -1420,7 +1471,7 @@ mod tests {
         let views = vec![&s];
 
         let lines = render_to_lines(100, 3, |f| {
-            draw_header(f, f.area(), &views, fixed_now());
+            draw_header(f, f.area(), &views, fixed_now(), None, false);
         });
         let expected = [
             "┌──────────────────────────────────────────────────────────────────────────────────────────────────┐",
@@ -1701,8 +1752,7 @@ mod tests {
             );
         });
         assert!(
-            lines[0]
-                .contains("sessions (1 of 4 — 3 hidden, A) — sort: activity ▼"),
+            lines[0].contains("sessions (1 of 4 — 3 hidden, A) — sort: activity ▼"),
             "title missing hidden hint: {}",
             lines[0]
         );
