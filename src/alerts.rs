@@ -72,10 +72,12 @@ pub fn parse_notify_on(spec: &str) -> Result<Vec<Trigger>> {
         let (lhs, rhs) = s
             .split_once('>')
             .ok_or_else(|| anyhow!("trigger '{s}' missing '>': expected NAME>VALUE"))?;
-        let v: f64 = rhs
-            .trim()
-            .parse()
-            .map_err(|_| anyhow!("trigger '{s}': cannot parse threshold '{}' as a number", rhs.trim()))?;
+        let v: f64 = rhs.trim().parse().map_err(|_| {
+            anyhow!(
+                "trigger '{s}': cannot parse threshold '{}' as a number",
+                rhs.trim()
+            )
+        })?;
         out.push(match lhs.trim() {
             "context" | "ctx" => Trigger::Context(v),
             "cost" | "$" => Trigger::Cost(v),
@@ -112,15 +114,33 @@ impl Alert {
 
     pub fn body(&self) -> String {
         match self {
-            Alert::Session { id, project, kind, value, threshold } if *kind == "context" => format!(
+            Alert::Session {
+                id,
+                project,
+                kind,
+                value,
+                threshold,
+            } if *kind == "context" => format!(
                 "{project} ({id}) context {:.0}% > {:.0}%",
                 value * 100.0,
                 threshold * 100.0
             ),
-            Alert::Session { id, project, kind, value, threshold } if *kind == "cost" => {
+            Alert::Session {
+                id,
+                project,
+                kind,
+                value,
+                threshold,
+            } if *kind == "cost" => {
                 format!("{project} ({id}) cost ${:.2} > ${:.2}", value, threshold)
             }
-            Alert::Session { id, project, kind, value, threshold } => {
+            Alert::Session {
+                id,
+                project,
+                kind,
+                value,
+                threshold,
+            } => {
                 format!("{project} ({id}) {kind} {value} > {threshold}")
             }
             Alert::Budget { total, budget } => {
@@ -175,7 +195,10 @@ impl AlertState {
             if total_cost > b {
                 if !self.budget_fired {
                     self.budget_fired = true;
-                    out.push(Alert::Budget { total: total_cost, budget: b });
+                    out.push(Alert::Budget {
+                        total: total_cost,
+                        budget: b,
+                    });
                 }
             } else {
                 self.budget_fired = false;
@@ -264,10 +287,7 @@ mod tests {
     #[test]
     fn parse_notify_on_handles_both_keys_and_ignores_blanks() {
         let trigs = parse_notify_on("context>0.9, cost>50, ").unwrap();
-        assert_eq!(
-            trigs,
-            vec![Trigger::Context(0.9), Trigger::Cost(50.0)]
-        );
+        assert_eq!(trigs, vec![Trigger::Context(0.9), Trigger::Cost(50.0)]);
         assert_eq!(parse_notify_on("").unwrap(), Vec::<Trigger>::new());
         // `ctx` and `$` are recognized aliases.
         let trigs = parse_notify_on("ctx>0.5,$>1.5").unwrap();
@@ -327,7 +347,10 @@ mod tests {
             threshold: 0.9,
         };
         assert_eq!(a.body(), "atop (abc12345) context 93% > 90%");
-        let b = Alert::Budget { total: 25.5, budget: 20.0 };
+        let b = Alert::Budget {
+            total: 25.5,
+            budget: 20.0,
+        };
         assert_eq!(b.body(), "total cost $25.50 exceeds budget $20.00");
     }
 }
